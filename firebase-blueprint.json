@@ -1,0 +1,65 @@
+{
+  "entities": {
+    "UserBackup": {
+      "title": "UserBackup",
+      "description": "Structured offline-first backup of a user's PulsoFit workouts, nutrition, body composition, hydration, and templates.",
+      "type": "object",
+      "properties": {
+        "ownerId": {
+          "type": "string",
+          "description": "Firebase Auth UID of the backup owner.",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "appName": {
+          "type": "string",
+          "enum": ["PulsoFit"],
+          "maxLength": 16
+        },
+        "schemaVersion": {
+          "type": "integer"
+        },
+        "localUpdatedAt": {
+          "type": "string",
+          "minLength": 10,
+          "maxLength": 40
+        },
+        "summary": {
+          "type": "object",
+          "description": "Quick summary counters for the cloud sync card."
+        },
+        "payload": {
+          "type": "object",
+          "description": "Structured AppDatabase map excluding local IndexedDB binary photo/audio blobs."
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time"
+        }
+      },
+      "required": [
+        "ownerId",
+        "appName",
+        "schemaVersion",
+        "localUpdatedAt",
+        "summary",
+        "payload",
+        "createdAt",
+        "updatedAt"
+      ]
+    }
+  },
+  "firestore": {
+    "/userBackups/{userId}": {
+      "schema": {
+        "$ref": "#/entities/UserBackup"
+      },
+      "description": "Single-document per-user private cloud backup keyed strictly by authenticated UID."
+    }
+  }
+}

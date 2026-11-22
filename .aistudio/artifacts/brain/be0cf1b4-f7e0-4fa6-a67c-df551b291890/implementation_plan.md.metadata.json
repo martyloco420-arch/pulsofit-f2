@@ -1,0 +1,6 @@
+{
+  "summary":  "Comprehensive V2 Phase 2 implementation plan for PulsoFit covering a unified daily 'Hoy' readiness dashboard, advanced strength training (custom templates, supersets, set types, RPE-based progressive overload hints, HIIT/Tabata timer, Bluetooth heart-rate monitor), rapid nutrition logging (barcode scanner, meal favorites, copy yesterday, AI 7-day meal planner & shopping list), physical progress & recovery tracking (body measurements, offline before/after progress photos, sleep/energy/soreness readiness check-in), and dual persistence/reporting (CSV/PDF export + optional opt-in Firebase cloud sync over local-first IndexedDB).",
+  "updatedAt":  "2026-11-19T20:06:09.473426374Z",
+  "requestFeedback":  true,
+  "userFacing":  true
+}

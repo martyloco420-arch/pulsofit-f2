@@ -1,0 +1,115 @@
+@import "tailwindcss";
+
+@theme {
+  --font-display: "Barlow Condensed", system-ui, sans-serif;
+  --font-sans: "Plus Jakarta Sans", system-ui, -apple-system, sans-serif;
+  --font-mono: "JetBrains Mono", ui-monospace, monospace;
+}
+
+@layer base {
+  html {
+    font-family: var(--font-sans);
+    background-color: #0A0B0D;
+    color: #F4F5F7;
+    -webkit-tap-highlight-color: transparent;
+    color-scheme: dark;
+  }
+
+  body {
+    margin: 0;
+    min-height: 100dvh;
+    overflow-x: hidden;
+  }
+
+  h1, h2, .font-display {
+    font-family: var(--font-display);
+    text-wrap: balance;
+  }
+}
+
+.tabular-nums {
+  font-variant-numeric: tabular-nums;
+}
+
+.pb-safe {
+  padding-bottom: env(safe-area-inset-bottom, 0px);
+}
+
+.pt-safe {
+  padding-top: env(safe-area-inset-top, 0px);
+}
+
+.no-scrollbar {
+  -ms-overflow-style: none;
+  scrollbar-width: none;
+}
+
+.no-scrollbar::-webkit-scrollbar {
+  display: none;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+  }
+}
+
+html.low-power-mode .animate-pulse,
+html.low-power-mode .animate-bounce,
+html.low-power-mode .animate-ping,
+html.low-power-mode .low-power-pause-anim {
+  animation: none !important;
+  animation-play-state: paused !important;
+}
+
+html.low-power-mode *,
+html.low-power-mode *::before,
+html.low-power-mode *::after {
+  transition-duration: 0.01ms !important;
+  scroll-behavior: auto !important;
+}
+
+html.low-power-mode header,
+html.low-power-mode nav,
+html.low-power-mode [class*="backdrop-blur"] {
+  backdrop-filter: none !important;
+  -webkit-backdrop-filter: none !important;
+}
+
+html.low-power-mode main {
+  filter: brightness(0.92);
+}
+
+html.low-power-mode main .text-zinc-400,
+html.low-power-mode main .text-zinc-500 {
+  opacity: 0.78;
+}
+
+html.low-power-mode main section,
+html.low-power-mode main article {
+  box-shadow: none !important;
+}
+
+.print-only {
+  display: none;
+}
+
+@media print {
+  html, body {
+    background-color: #ffffff !important;
+    color: #111827 !important;
+  }
+
+  .no-print {
+    display: none !important;
+  }
+
+  .print-only {
+    display: block !important;
+    background: #ffffff !important;
+    color: #111827 !important;
+  }
+}
+

@@ -1,0 +1,6 @@
+{
+  "name": "PulsoFit",
+  "description": "Aplicación web progresiva de entrenamiento, progreso, nutrición y recuperación muscular diseñada para el gimnasio.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

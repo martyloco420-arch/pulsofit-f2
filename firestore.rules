@@ -1,0 +1,106 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    match /{document=**} {
+      allow read, write: if false;
+    }
+
+    function isValidId(id) {
+      return id is string && id.size() >= 1 && id.size() <= 128 && id.matches('^[a-zA-Z0-9_\\-]+$');
+    }
+
+    function incoming() {
+      return request.resource.data;
+    }
+
+    function existing() {
+      return resource.data;
+    }
+
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    function isVerifiedUser() {
+      return isSignedIn() && request.auth.token.email_verified == true;
+    }
+
+    function isValidSummary(summary) {
+      return summary is map
+        && summary.keys().hasAll(['workoutsCount', 'foodLogsCount', 'cardioCount', 'weightKg'])
+        && summary.keys().hasOnly(['workoutsCount', 'foodLogsCount', 'cardioCount', 'weightKg'])
+        && summary.workoutsCount is int && summary.workoutsCount >= 0
+        && summary.foodLogsCount is int && summary.foodLogsCount >= 0
+        && summary.cardioCount is int && summary.cardioCount >= 0
+        && (summary.weightKg is int || summary.weightKg is float) && summary.weightKg >= 20 && summary.weightKg <= 400;
+    }
+
+    function isValidPayload(payload) {
+      return payload is map
+        && payload.keys().hasAll(['schemaVersion', 'updatedAt', 'profile'])
+        && payload.schemaVersion is int
+        && payload.updatedAt is string && payload.updatedAt.size() >= 10 && payload.updatedAt.size() <= 40
+        && payload.profile is map;
+    }
+
+    function isValidUserBackup(data) {
+      return data.keys().hasAll([
+          'ownerId',
+          'appName',
+          'schemaVersion',
+          'localUpdatedAt',
+          'summary',
+          'payload',
+          'createdAt',
+          'updatedAt'
+        ])
+        && data.keys().hasOnly([
+          'ownerId',
+          'appName',
+          'schemaVersion',
+          'localUpdatedAt',
+          'summary',
+          'payload',
+          'createdAt',
+          'updatedAt'
+        ])
+        && isValidId(data.ownerId)
+        && data.ownerId == request.auth.uid
+        && data.appName is string && data.appName.size() <= 16 && data.appName == 'PulsoFit'
+        && data.schemaVersion is int && data.schemaVersion >= 1 && data.schemaVersion <= 20
+        && data.localUpdatedAt is string && data.localUpdatedAt.size() >= 10 && data.localUpdatedAt.size() <= 40
+        && isValidSummary(data.summary)
+        && isValidPayload(data.payload)
+        && data.createdAt is timestamp
+        && data.updatedAt is timestamp;
+    }
+
+    match /userBackups/{userId} {
+      allow get: if isSignedIn() && isValidId(userId) && request.auth.uid == userId;
+      allow list: if false;
+      allow create: if isVerifiedUser()
+        && isValidId(userId)
+        && request.auth.uid == userId
+        && isValidUserBackup(incoming())
+        && incoming().ownerId == userId
+        && incoming().createdAt == request.time
+        && incoming().updatedAt == request.time;
+      allow update: if isVerifiedUser()
+        && isValidId(userId)
+        && request.auth.uid == userId
+        && isValidUserBackup(incoming())
+        && incoming().ownerId == existing().ownerId
+        && incoming().appName == existing().appName
+        && incoming().createdAt == existing().createdAt
+        && incoming().updatedAt == request.time
+        && incoming().diff(existing()).affectedKeys().hasOnly([
+          'schemaVersion',
+          'localUpdatedAt',
+          'summary',
+          'payload',
+          'updatedAt'
+        ]);
+      allow delete: if isVerifiedUser() && isValidId(userId) && request.auth.uid == userId;
+    }
+  }
+}
