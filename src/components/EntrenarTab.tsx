@@ -7,6 +7,7 @@ import {
   MapPin,
   Share2,
   Sparkles,
+  Trophy,
   X,
   Zap,
 } from 'lucide-react';
@@ -24,6 +25,7 @@ import {
   buildRecentLoadsSummary,
   getPreviousExerciseSets,
 } from '../lib/analytics';
+import { roundToPracticalWeightKg } from '../lib/progressiveOverload';
 import {
   connectBluetoothHeartRateMonitor,
   type HeartRateDeviceHandle,
@@ -84,6 +86,7 @@ import type {
   WorkoutTemplate,
   WorkoutTemplateExercise,
 } from '../types/fitness';
+import { useHardwareManager } from '../hooks/useHardwareManager';
 import {
   ExerciseDemoModal,
   type InspectedExerciseInfo,
@@ -93,6 +96,7 @@ import { ActiveWorkoutSession } from './entrenar/ActiveWorkoutSession';
 import { ExerciseCatalogModal } from './entrenar/ExerciseCatalogModal';
 import {
   RestTimerBar,
+  computeRemainingSeconds,
   formatSeconds,
   playRestBeep,
   triggerRestCompletionVibration,
@@ -168,11 +172,6 @@ interface AiAlternativeOption {
   reason: string;
 }
 
-interface WakeLockSentinelLike {
-  release: () => Promise<void>;
-  released?: boolean;
-}
-
 export const EntrenarTab: React.FC<EntrenarTabProps> = ({
   database,
   profile,
@@ -219,8 +218,12 @@ export const EntrenarTab: React.FC<EntrenarTabProps> = ({
   const [elapsedSec, setElapsedSec] = useState(0);
   const [restRemaining, setRestRemaining] = useState<number | null>(null);
   const [restTotal, setRestTotal] = useState(profile.preferredRestSec ?? 90);
+  const [restTargetEndTime, setRestTargetEndTime] = useState<number | null>(
+    null,
+  );
+  const [restPaused, setRestPaused] = useState(false);
   const [showExercisePicker, setShowExercisePicker] = useState(false);
-  const [wakeLockActive, setWakeLockActive] = useState(false);
+  const hardware = useHardwareManager();
   const [setWeightDrafts, setSetWeightDrafts] = useState<
     Record<string, string>
   >({});
@@ -277,8 +280,8 @@ export const EntrenarTab: React.FC<EntrenarTabProps> = ({
   >(null);
 
   const restEndRef = useRef<number | null>(null);
+  const pausedRestMsRef = useRef<number>(0);
   const tenSecWarnedRef = useRef(false);
-  const wakeLockRef = useRef<WakeLockSentinelLike | null>(null);
   const restContextRef = useRef<{
     nextSetNum: number;
     exerciseName: string;
@@ -414,75 +417,15 @@ export const EntrenarTab: React.FC<EntrenarTabProps> = ({
     speakAndRemember(cue, overrideEnabled);
   };
 
-  // Screen Wake Lock automatically active while strength workout is running
-  useEffect(() => {
-    let active = true;
-
-    const acquire = async () => {
-      try {
-        const nav = navigator as unknown as {
-          wakeLock?: {
-            request: (type: 'screen') => Promise<WakeLockSentinelLike>;
-          };
-        };
-        if (!nav.wakeLock || !activeWorkout) return;
-        if (wakeLockRef.current && !wakeLockRef.current.released) {
-          if (active) setWakeLockActive(true);
-          return;
-        }
-        const sentinel = await nav.wakeLock.request('screen');
-        if (!active) {
-          void sentinel.release();
-          return;
-        }
-        wakeLockRef.current = sentinel;
-        setWakeLockActive(true);
-      } catch {
-        if (active) setWakeLockActive(false);
-      }
-    };
-
-    const release = async () => {
-      try {
-        if (wakeLockRef.current) {
-          await wakeLockRef.current.release();
-        }
-      } catch {
-        // Ignore release errors
-      } finally {
-        wakeLockRef.current = null;
-        if (active) setWakeLockActive(false);
-      }
-    };
-
-    if (!activeWorkout) {
-      void release();
-      return () => {
-        active = false;
-      };
-    }
-
-    void acquire();
-    const onVisibility = () => {
-      if (document.visibilityState === 'visible' && activeWorkout) {
-        void acquire();
-      }
-    };
-    document.addEventListener('visibilitychange', onVisibility);
-
-    return () => {
-      active = false;
-      document.removeEventListener('visibilitychange', onVisibility);
-      void release();
-    };
-  }, [Boolean(activeWorkout)]);
-
-  // Elapsed workout timer
+  // Elapsed workout timer (wall-clock timestamps + visibilitychange sync)
   useEffect(() => {
     if (!activeWorkout) {
       setElapsedSec(0);
       setRestRemaining(null);
+      setRestTargetEndTime(null);
+      setRestPaused(false);
       restEndRef.current = null;
+      pausedRestMsRef.current = 0;
       restContextRef.current = null;
       tenSecWarnedRef.current = false;
       setActiveExerciseIdx(0);
@@ -490,7 +433,7 @@ export const EntrenarTab: React.FC<EntrenarTabProps> = ({
       setActiveRpePrompt(null);
       setOverloadAppliedNote({});
       cancelCoachSpeech();
-      return;
+      return undefined;
     }
 
     const update = () => {
@@ -499,20 +442,33 @@ export const EntrenarTab: React.FC<EntrenarTabProps> = ({
         setElapsedSec(Math.max(0, Math.floor((Date.now() - startMs) / 1000)));
       }
     };
+    const handleVisibilityChange = () => {
+      if (document.visibilityState === 'visible') {
+        update();
+      }
+    };
     update();
     const id = window.setInterval(update, 1000);
-    return () => window.clearInterval(id);
+    document.addEventListener('visibilitychange', handleVisibilityChange);
+    return () => {
+      window.clearInterval(id);
+      document.removeEventListener('visibilitychange', handleVisibilityChange);
+    };
   }, [activeWorkout]);
 
-  // Rest countdown timer + 10s warning + sound + vibration + voice cue
+  // Rest countdown timer (absolute targetEndTime + visibilitychange sync + 10s warning + sound + vibration + voice cue)
   useEffect(() => {
-    if (restRemaining === null) return;
-    const id = window.setInterval(() => {
+    if (restRemaining === null || restPaused) return undefined;
+
+    const syncRestCountdown = () => {
       if (restEndRef.current === null) return;
-      const diff = Math.ceil((restEndRef.current - Date.now()) / 1000);
+      const diff = computeRemainingSeconds(restEndRef.current);
       if (diff <= 0) {
         restEndRef.current = null;
+        pausedRestMsRef.current = 0;
         tenSecWarnedRef.current = false;
+        setRestTargetEndTime(null);
+        setRestPaused(false);
         setRestRemaining(null);
         playRestBeep();
         triggerRestCompletionVibration();
@@ -538,9 +494,28 @@ export const EntrenarTab: React.FC<EntrenarTabProps> = ({
         }
         setRestRemaining(diff);
       }
-    }, 250);
-    return () => window.clearInterval(id);
-  }, [restRemaining !== null, voiceCoachEnabled, isAudioMuted, weightUnit]);
+    };
+
+    const handleVisibilityChange = () => {
+      if (document.visibilityState === 'visible') {
+        syncRestCountdown();
+      }
+    };
+
+    syncRestCountdown();
+    const id = window.setInterval(syncRestCountdown, 250);
+    document.addEventListener('visibilitychange', handleVisibilityChange);
+    return () => {
+      window.clearInterval(id);
+      document.removeEventListener('visibilitychange', handleVisibilityChange);
+    };
+  }, [
+    restRemaining !== null,
+    restPaused,
+    voiceCoachEnabled,
+    isAudioMuted,
+    weightUnit,
+  ]);
 
   const startRestTimer = (
     seconds: number,
@@ -551,35 +526,89 @@ export const EntrenarTab: React.FC<EntrenarTabProps> = ({
     },
   ) => {
     const safeSec = Math.max(15, seconds);
+    const remainingMs = safeSec * 1000;
+    const targetEndTime = Date.now() + remainingMs;
     setRestTotal(safeSec);
-    restEndRef.current = Date.now() + safeSec * 1000;
+    restEndRef.current = targetEndTime;
+    pausedRestMsRef.current = remainingMs;
     tenSecWarnedRef.current = safeSec <= 10;
     restContextRef.current = context ?? null;
+    setRestPaused(false);
+    setRestTargetEndTime(targetEndTime);
     setRestRemaining(safeSec);
   };
 
-  const adjustRestTimer = (delta: number) => {
-    if (restEndRef.current === null) return;
-    const next = Math.max(
-      0,
-      Math.ceil((restEndRef.current - Date.now()) / 1000) + delta,
-    );
-    if (next <= 0) {
+  const togglePauseRestTimer = () => {
+    if (restRemaining === null) return;
+    if (!restPaused) {
+      const remainingMs =
+        restEndRef.current !== null
+          ? Math.max(0, restEndRef.current - Date.now())
+          : restRemaining * 1000;
+      pausedRestMsRef.current = remainingMs;
       restEndRef.current = null;
+      setRestTargetEndTime(null);
+      setRestPaused(true);
+      setRestRemaining(Math.max(0, Math.ceil(remainingMs / 1000)));
+    } else {
+      const remainingMs = Math.max(0, pausedRestMsRef.current);
+      if (remainingMs <= 0) {
+        restEndRef.current = null;
+        pausedRestMsRef.current = 0;
+        restContextRef.current = null;
+        tenSecWarnedRef.current = false;
+        setRestTargetEndTime(null);
+        setRestPaused(false);
+        setRestRemaining(null);
+        return;
+      }
+      const targetEndTime = Date.now() + remainingMs;
+      restEndRef.current = targetEndTime;
+      setRestTargetEndTime(targetEndTime);
+      setRestPaused(false);
+      setRestRemaining(computeRemainingSeconds(targetEndTime));
+    }
+  };
+
+  const adjustRestTimer = (delta: number) => {
+    if (restRemaining === null) return;
+    const baseMs = restPaused
+      ? pausedRestMsRef.current
+      : restEndRef.current !== null
+        ? Math.max(0, restEndRef.current - Date.now())
+        : 0;
+    const nextMs = Math.max(0, baseMs + delta * 1000);
+    const nextSec = Math.ceil(nextMs / 1000);
+    if (nextSec <= 0) {
+      restEndRef.current = null;
+      pausedRestMsRef.current = 0;
       restContextRef.current = null;
       tenSecWarnedRef.current = false;
+      setRestTargetEndTime(null);
+      setRestPaused(false);
       setRestRemaining(null);
+    } else if (restPaused) {
+      pausedRestMsRef.current = nextMs;
+      if (nextSec > 10) tenSecWarnedRef.current = false;
+      setRestRemaining(nextSec);
     } else {
-      restEndRef.current = Date.now() + next * 1000;
-      if (next > 10) tenSecWarnedRef.current = false;
-      setRestRemaining(next);
+      const targetEndTime = Date.now() + nextMs;
+      restEndRef.current = targetEndTime;
+      if (nextSec > 10) tenSecWarnedRef.current = false;
+      setRestTargetEndTime(targetEndTime);
+      setRestRemaining(nextSec);
     }
   };
 
   const restartRestTimer = () => {
     const safeTotal = Math.max(15, restTotal || preferredRestSec);
-    restEndRef.current = Date.now() + safeTotal * 1000;
+    const remainingMs = safeTotal * 1000;
+    const targetEndTime = Date.now() + remainingMs;
+    restEndRef.current = targetEndTime;
+    pausedRestMsRef.current = remainingMs;
     tenSecWarnedRef.current = safeTotal <= 10;
+    setRestPaused(false);
+    setRestTargetEndTime(targetEndTime);
     setRestRemaining(safeTotal);
   };
 
@@ -587,8 +616,11 @@ export const EntrenarTab: React.FC<EntrenarTabProps> = ({
     if (restRemaining === null) return;
     const ctx = restContextRef.current;
     restEndRef.current = null;
+    pausedRestMsRef.current = 0;
     restContextRef.current = null;
     tenSecWarnedRef.current = false;
+    setRestTargetEndTime(null);
+    setRestPaused(false);
     setRestRemaining(null);
     if (ctx?.nextExercise) {
       speakAndRemember(buildExerciseStartCue(ctx.nextExercise, weightUnit));
@@ -1058,18 +1090,10 @@ export const EntrenarTab: React.FC<EntrenarTabProps> = ({
             sets: ex.sets.map((s) => {
               if (s.completed || s.setType === 'warmup' || s.weightKg <= 0)
                 return s;
-              if (weightUnit === 'lb') {
-                const reducedLb = Math.max(
-                  5,
-                  Math.round(
-                    (kgToDisplayWeight(s.weightKg, 'lb') * factor) / 2.5,
-                  ) * 2.5,
-                );
-                return { ...s, weightKg: displayWeightToKg(reducedLb, 'lb') };
-              }
-              const reducedKg = Math.max(
-                1,
-                Math.round(s.weightKg * factor * 2) / 2,
+              const reducedKg = roundToPracticalWeightKg(
+                s.weightKg * factor,
+                weightUnit,
+                s.weightKg,
               );
               return { ...s, weightKg: reducedKg };
             }),
@@ -1080,7 +1104,7 @@ export const EntrenarTab: React.FC<EntrenarTabProps> = ({
             ? s
             : { ...s, reps: Math.max(1, Math.round(s.reps * factor)) },
         );
-        if (updatedSets.length > 2) {
+        if (updatedSets.length > 1) {
           const lastPendingIdx = [...updatedSets]
             .reverse()
             .findIndex((s) => !s.completed && s.setType !== 'warmup');
@@ -1577,6 +1601,12 @@ export const EntrenarTab: React.FC<EntrenarTabProps> = ({
                     <p className="text-sm text-zinc-400 mt-1">
                       {lastCompletedSession.title}
                     </p>
+                    {lastCompletedSession.isPR && (
+                      <div className="mt-2 inline-flex items-center gap-1.5 rounded-full border border-amber-400/60 bg-gradient-to-r from-amber-400/20 via-[#D4FF33]/20 to-amber-400/15 px-3 py-1 text-xs font-extrabold text-amber-200">
+                        <Trophy className="w-3.5 h-3.5 text-[#D4FF33]" />
+                        <span>¡Nuevo Récord Personal (PR)!</span>
+                      </div>
+                    )}
                   </div>
                   <button
                     type="button"
@@ -1762,7 +1792,7 @@ export const EntrenarTab: React.FC<EntrenarTabProps> = ({
               workouts={workouts}
               weightUnit={weightUnit}
               elapsedSec={elapsedSec}
-              wakeLockActive={wakeLockActive}
+              wakeLockActive={hardware.wakeLockActive}
               hrBpm={hrBpm}
               hrDeviceName={hrDeviceName}
               hrError={hrError}
@@ -1780,6 +1810,7 @@ export const EntrenarTab: React.FC<EntrenarTabProps> = ({
               restRemaining={restRemaining}
               restTotal={restTotal}
               recoveryIndex={recoveryIndex}
+              decayedFatigue={decayedFatigue}
               sleepPulseAlert={sleepPulseAlert}
               activeRpePrompt={activeRpePrompt}
               setActiveRpePrompt={setActiveRpePrompt}
@@ -2022,10 +2053,13 @@ export const EntrenarTab: React.FC<EntrenarTabProps> = ({
         <RestTimerBar
           restRemaining={restRemaining}
           restTotal={restTotal}
+          targetEndTime={restTargetEndTime}
+          isPaused={restPaused}
           nextExerciseLabel={restContextRef.current?.exerciseName}
           onAdjust={adjustRestTimer}
           onRestart={restartRestTimer}
           onSkip={handleSkipRest}
+          onTogglePause={togglePauseRestTimer}
         />
       )}
 

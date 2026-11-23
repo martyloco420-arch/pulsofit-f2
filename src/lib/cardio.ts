@@ -42,6 +42,27 @@ export function getActivityMeta(type: CardioActivityType) {
   return ACTIVITY_OPTIONS.find((a) => a.id === type) ?? ACTIVITY_OPTIONS[0];
 }
 
+export const GPS_INITIAL_MAX_ACCURACY_M = 50;
+export const GPS_SUBSEQUENT_MAX_ACCURACY_M = 25;
+export const GPS_MIN_DISPLACEMENT_METERS = 2;
+export const GPS_MAX_INSTANT_SPEED_MPS = 9.72; // 35 km/h
+export const GPS_MAX_INSTANT_SPEED_KMH = 35;
+
+export type GpsSignalQuality = 'optima' | 'aceptable' | 'buscando';
+
+export function classifyGpsSignalQuality(accuracyM: number | null): {
+  quality: GpsSignalQuality;
+  label: string;
+} {
+  if (accuracyM === null || !Number.isFinite(accuracyM) || accuracyM > 25) {
+    return { quality: 'buscando', label: 'Buscando señal' };
+  }
+  if (accuracyM <= 10) {
+    return { quality: 'optima', label: 'Óptima' };
+  }
+  return { quality: 'aceptable', label: 'Aceptable' };
+}
+
 export function haversineDistanceKm(a: GpsPoint, b: GpsPoint): number {
   const R = 6371; // km
   const toRad = (deg: number) => (deg * Math.PI) / 180;
@@ -57,6 +78,97 @@ export function haversineDistanceKm(a: GpsPoint, b: GpsPoint): number {
     sinDLat * sinDLat + Math.cos(lat1) * Math.cos(lat2) * sinDLon * sinDLon;
   const c = 2 * Math.atan2(Math.sqrt(h), Math.sqrt(1 - h));
   return R * c;
+}
+
+export type GpsPointValidationResult =
+  | {
+      accepted: true;
+      isInitial: boolean;
+      distanceKm: number;
+      distanceMeters: number;
+      dtSec: number;
+      speedMps: number;
+      speedKmh: number;
+    }
+  | {
+      accepted: false;
+      reason: 'accuracy' | 'drift' | 'speed_jump' | 'invalid_timestamp';
+      distanceMeters?: number;
+      speedMps?: number;
+    };
+
+export function validateGpsPoint(
+  candidate: GpsPoint,
+  lastValidPoint: GpsPoint | null,
+): GpsPointValidationResult {
+  const accuracy =
+    typeof candidate.accuracyM === 'number' && Number.isFinite(candidate.accuracyM)
+      ? candidate.accuracyM
+      : Infinity;
+
+  if (!lastValidPoint) {
+    if (accuracy > GPS_INITIAL_MAX_ACCURACY_M) {
+      return { accepted: false, reason: 'accuracy' };
+    }
+    return {
+      accepted: true,
+      isInitial: true,
+      distanceKm: 0,
+      distanceMeters: 0,
+      dtSec: 0,
+      speedMps: 0,
+      speedKmh: 0,
+    };
+  }
+
+  if (accuracy > GPS_SUBSEQUENT_MAX_ACCURACY_M) {
+    return { accepted: false, reason: 'accuracy' };
+  }
+
+  const distanceKm = haversineDistanceKm(lastValidPoint, candidate);
+  const distanceMeters = distanceKm * 1000;
+  if (distanceMeters < GPS_MIN_DISPLACEMENT_METERS) {
+    return {
+      accepted: false,
+      reason: 'drift',
+      distanceMeters,
+    };
+  }
+
+  const dtMs = candidate.timestamp - lastValidPoint.timestamp;
+  if (!Number.isFinite(dtMs) || dtMs <= 0) {
+    return {
+      accepted: false,
+      reason: 'invalid_timestamp',
+      distanceMeters,
+    };
+  }
+
+  const dtSec = dtMs / 1000;
+  const speedMps = distanceMeters / dtSec;
+  const speedKmh = speedMps * 3.6;
+
+  if (
+    speedMps > GPS_MAX_INSTANT_SPEED_MPS ||
+    speedKmh > GPS_MAX_INSTANT_SPEED_KMH
+  ) {
+    return {
+      accepted: false,
+      reason: 'speed_jump',
+      distanceMeters,
+      speedMps,
+    };
+  }
+
+  return {
+    accepted: true,
+    isInitial: false,
+    distanceKm,
+    distanceMeters,
+    dtSec,
+    speedMps,
+    speedKmh,
+  };
 }
 
 export function estimateCardioCalories(

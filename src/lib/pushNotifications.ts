@@ -1,10 +1,11 @@
 import type { AppDatabase } from '../types/fitness';
-import { getLocalDateKey, getTodayIsoDate } from './storage';
+import { getActiveProfileId, getLocalDateKey, getTodayIsoDate } from './storage';
 
 export const PUSH_PREFS_LS_KEY = 'pulsofit_push_prefs_v1';
 export const PUSH_ENDPOINT_LS_KEY = 'pulsofit_push_endpoint_v1';
 
 export interface PushReminderPreferences {
+  smartRemindersEnabled: boolean;
   waterEnabled: boolean;
   waterIntervalMin: number;
   waterStartTime: string;
@@ -25,6 +26,7 @@ export function getBrowserTimeZone(): string {
 
 export function getDefaultPushPreferences(): PushReminderPreferences {
   return {
+    smartRemindersEnabled: false,
     waterEnabled: false,
     waterIntervalMin: 90,
     waterStartTime: '08:00',
@@ -66,8 +68,17 @@ export function loadPushPreferences(): PushReminderPreferences {
     const raw = localStorage.getItem(PUSH_PREFS_LS_KEY);
     if (!raw) return defaults;
     const parsed = JSON.parse(raw) as Partial<PushReminderPreferences>;
+    const smartRemindersEnabled =
+      typeof parsed.smartRemindersEnabled === 'boolean'
+        ? parsed.smartRemindersEnabled
+        : Boolean(parsed.waterEnabled);
+    const waterEnabled =
+      typeof parsed.waterEnabled === 'boolean'
+        ? parsed.waterEnabled
+        : smartRemindersEnabled;
     return {
-      waterEnabled: Boolean(parsed.waterEnabled),
+      smartRemindersEnabled,
+      waterEnabled,
       waterIntervalMin:
         typeof parsed.waterIntervalMin === 'number' && Number.isFinite(parsed.waterIntervalMin)
           ? Math.max(15, Math.min(360, Math.round(parsed.waterIntervalMin)))
@@ -134,7 +145,19 @@ async function ensurePushServiceWorkerRegistration(): Promise<ServiceWorkerRegis
     throw new Error('Tu navegador no soporta Service Workers.');
   }
 
-  let registration = await navigator.serviceWorker.getRegistration();
+  // Reuse VitePWA's main registration (/sw.js, which already imports /push-sw.js)
+  // or an existing /push-sw.js registration without replacing VitePWA's SW.
+  let registration = await navigator.serviceWorker.getRegistration('/');
+  if (!registration && typeof navigator.serviceWorker.getRegistrations === 'function') {
+    const registrations = await navigator.serviceWorker.getRegistrations();
+    registration =
+      registrations.find((reg) => {
+        const scriptUrl =
+          reg.active?.scriptURL || reg.waiting?.scriptURL || reg.installing?.scriptURL || '';
+        return scriptUrl.endsWith('/sw.js') || scriptUrl.endsWith('/push-sw.js');
+      }) ?? registrations[0];
+  }
+
   if (!registration) {
     registration = await navigator.serviceWorker.register('/push-sw.js', { scope: '/' });
   }
@@ -146,7 +169,7 @@ async function ensurePushServiceWorkerRegistration(): Promise<ServiceWorkerRegis
     ),
   ]);
 
-  return readyReg;
+  return readyReg ?? registration;
 }
 
 export async function requestPushPermission(): Promise<NotificationPermission | 'unsupported'> {
@@ -185,6 +208,7 @@ export async function getExistingPushSubscription(): Promise<PushSubscription | 
 export async function subscribeToWebPush(
   prefs: PushReminderPreferences,
   lastWorkoutDate?: string | null,
+  profileId?: string,
 ): Promise<{ ok: boolean; subscribed: boolean; permission: NotificationPermission | 'unsupported'; error?: string }> {
   if (!isPushSupported()) {
     return {
@@ -195,6 +219,7 @@ export async function subscribeToWebPush(
     };
   }
 
+  const resolvedProfileId = (profileId || getActiveProfileId() || 'main').trim() || 'main';
   const permission = await requestPushPermission();
   if (permission !== 'granted') {
     return {
@@ -234,12 +259,19 @@ export async function subscribeToWebPush(
       // Ignore
     }
 
+    const normalizedPrefs: PushReminderPreferences = {
+      ...prefs,
+      smartRemindersEnabled: prefs.smartRemindersEnabled || prefs.waterEnabled,
+      waterEnabled: prefs.waterEnabled || prefs.smartRemindersEnabled,
+    };
+
     const saveResp = await fetch('/api/push/subscribe', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
+        profileId: resolvedProfileId,
         subscription: subJson,
-        preferences: prefs,
+        preferences: normalizedPrefs,
         lastWorkoutDate: lastWorkoutDate ?? undefined,
       }),
     });
@@ -266,16 +298,19 @@ export async function subscribeToWebPush(
 export async function syncPushPreferences(
   prefs: PushReminderPreferences,
   lastWorkoutDate?: string | null,
+  profileId?: string,
 ): Promise<{ ok: boolean; subscribed: boolean; error?: string }> {
   if (!isPushSupported()) {
     return { ok: false, subscribed: false };
   }
 
+  const resolvedProfileId = (profileId || getActiveProfileId() || 'main').trim() || 'main';
+
   try {
     const existing = await getExistingPushSubscription();
     if (!existing) {
-      if (prefs.waterEnabled || prefs.workoutEnabled) {
-        const res = await subscribeToWebPush(prefs, lastWorkoutDate);
+      if (prefs.smartRemindersEnabled || prefs.waterEnabled || prefs.workoutEnabled) {
+        const res = await subscribeToWebPush(prefs, lastWorkoutDate, resolvedProfileId);
         return { ok: res.ok, subscribed: res.subscribed, error: res.error };
       }
       return { ok: true, subscribed: false };
@@ -285,6 +320,7 @@ export async function syncPushPreferences(
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
+        profileId: resolvedProfileId,
         subscription: existing.toJSON(),
         preferences: prefs,
         lastWorkoutDate: lastWorkoutDate ?? undefined,
@@ -301,10 +337,13 @@ export async function syncPushPreferences(
   }
 }
 
-export async function unsubscribeFromWebPush(): Promise<{ ok: boolean; error?: string }> {
+export async function unsubscribeFromWebPush(
+  profileId?: string,
+): Promise<{ ok: boolean; error?: string }> {
   if (!isPushSupported()) {
     return { ok: true };
   }
+  const resolvedProfileId = (profileId || getActiveProfileId() || 'main').trim() || 'main';
   try {
     const existing = await getExistingPushSubscription();
     const cachedEndpoint = (() => {
@@ -325,11 +364,14 @@ export async function unsubscribeFromWebPush(): Promise<{ ok: boolean; error?: s
       // Ignore
     }
 
-    if (endpoint && navigator.onLine !== false) {
+    if ((endpoint || resolvedProfileId) && navigator.onLine !== false) {
       await fetch('/api/push/unsubscribe', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ endpoint }),
+        body: JSON.stringify({
+          endpoint: endpoint ?? undefined,
+          profileId: resolvedProfileId,
+        }),
       }).catch(() => undefined);
     }
     return { ok: true };
@@ -344,11 +386,13 @@ export async function unsubscribeFromWebPush(): Promise<{ ok: boolean; error?: s
 export async function sendTestWebPush(
   kind: 'water' | 'workout' | 'test' = 'test',
   prefs?: PushReminderPreferences,
+  profileId?: string,
 ): Promise<{ ok: boolean; error?: string }> {
+  const resolvedProfileId = (profileId || getActiveProfileId() || 'main').trim() || 'main';
   try {
     let sub = await getExistingPushSubscription();
     if (!sub && prefs) {
-      const subRes = await subscribeToWebPush(prefs);
+      const subRes = await subscribeToWebPush(prefs, undefined, resolvedProfileId);
       if (!subRes.ok) {
         return { ok: false, error: subRes.error };
       }
@@ -360,6 +404,7 @@ export async function sendTestWebPush(
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
         endpoint: sub?.endpoint,
+        profileId: resolvedProfileId,
         kind,
       }),
     });
@@ -421,6 +466,7 @@ export async function notifyPushActivity(
         type,
         date: localDate,
         endpoint: endpoint ?? undefined,
+        profileId: getActiveProfileId(),
       }),
       keepalive: true,
     });
@@ -487,6 +533,7 @@ export async function reconcilePushActivityState(db: AppDatabase): Promise<void>
       body: JSON.stringify({
         action: 'reconcile',
         endpoint,
+        profileId: getActiveProfileId(),
         lastWaterTimestamp,
         lastWorkoutDate,
       }),

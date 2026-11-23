@@ -9,6 +9,7 @@ import {
   FileSpreadsheet,
   RefreshCw,
   Ruler,
+  ShieldCheck,
   Sparkles,
   Trash2,
   Upload,
@@ -71,6 +72,7 @@ import { PushNotificationsCard } from './PushNotificationsCard';
 
 interface PerfilTabProps {
   database: AppDatabase;
+  activeProfileId?: string;
   activeProfileLabel?: string;
   onUpdateProfile: (profile: UserProfile) => void;
   onResetMuscleFatigue: () => void;
@@ -98,6 +100,7 @@ interface PerfilTabProps {
   onUpdateHydrationSettings?: (next: HydrationSettings) => void;
   isHydrated?: boolean;
   openPushSettingsSignal?: number;
+  onOpenQuickOnboarding?: () => void;
 }
 
 const GOAL_OPTIONS: { id: Goal; label: string; desc: string }[] = [
@@ -114,6 +117,7 @@ const SEX_OPTIONS: { id: Sex; label: string }[] = [
 
 export const PerfilTab: React.FC<PerfilTabProps> = ({
   database,
+  activeProfileId,
   activeProfileLabel = 'Principal',
   onUpdateProfile,
   onResetMuscleFatigue,
@@ -141,6 +145,7 @@ export const PerfilTab: React.FC<PerfilTabProps> = ({
   onUpdateHydrationSettings,
   isHydrated = true,
   openPushSettingsSignal = 0,
+  onOpenQuickOnboarding,
 }) => {
   const { profile, muscleFatigue } = database;
   const [perfilSubTab, setPerfilSubTab] = useState<'perfil' | 'datos'>(
@@ -428,15 +433,28 @@ export const PerfilTab: React.FC<PerfilTabProps> = ({
   return (
     <div className="space-y-6">
       <div className="space-y-4">
-        <div>
-          <h1 className="text-3xl sm:text-4xl font-extrabold font-display tracking-tight text-white">
-            {perfilSubTab === 'perfil' ? 'Perfil y recuperación' : 'Datos, Sueño y Signos'}
-          </h1>
-          <p className="mt-1 text-sm text-zinc-400">
-            {perfilSubTab === 'perfil'
-              ? 'Tus datos calculan tus calorías, adaptan tus rutinas y miden la fatiga muscular.'
-              : 'Administra respaldos JSON/CSV, monitor de sueño, pulso PPG y comparación de fechas.'}
-          </p>
+        <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+          <div>
+            <h1 className="text-3xl sm:text-4xl font-extrabold font-display tracking-tight text-white">
+              {perfilSubTab === 'perfil' ? 'Perfil y recuperación' : 'Datos, Sueño y Signos'}
+            </h1>
+            <p className="mt-1 text-sm text-zinc-400">
+              {perfilSubTab === 'perfil'
+                ? 'Tus datos calculan tus calorías, adaptan tus rutinas y miden la fatiga muscular.'
+                : 'Administra respaldos JSON/CSV, monitor de sueño, pulso PPG y comparación de fechas.'}
+            </p>
+          </div>
+
+          {perfilSubTab === 'perfil' && onOpenQuickOnboarding && (
+            <button
+              type="button"
+              onClick={onOpenQuickOnboarding}
+              className="min-h-[42px] inline-flex items-center justify-center gap-2 rounded-2xl border border-[#D4FF33]/40 bg-[#D4FF33]/10 hover:bg-[#D4FF33]/18 px-4 text-xs font-extrabold text-[#D4FF33] transition-colors shrink-0"
+            >
+              <Sparkles className="w-4 h-4 shrink-0" />
+              <span>Calibración rápida (30 seg)</span>
+            </button>
+          )}
         </div>
 
         {/* Sub-tabs inside Perfil: Mi Perfil | Datos y Respaldos */}
@@ -503,6 +521,56 @@ export const PerfilTab: React.FC<PerfilTabProps> = ({
         />
       ) : (
         <>
+      {/* BÓVEDA DE DATOS LOCALES (DISCRETA) */}
+      <section
+        aria-label="Bóveda de Datos Locales"
+        className="rounded-2xl border border-[#222631] bg-[#12141A] px-4 py-3.5 flex flex-col sm:flex-row sm:items-center justify-between gap-3"
+      >
+        <div className="flex items-start gap-3 min-w-0">
+          <div className="w-9 h-9 rounded-xl border border-[#a3e635]/30 bg-[#a3e635]/10 flex items-center justify-center text-[#a3e635] shrink-0 mt-0.5">
+            <ShieldCheck className="w-4 h-4" />
+          </div>
+          <div className="min-w-0">
+            <div className="flex items-center gap-2 flex-wrap">
+              <h2 className="text-sm font-bold text-white">
+                Bóveda de Datos Locales
+              </h2>
+              <span className="text-[11px] font-mono text-zinc-400">
+                {activeProfileLabel}
+              </span>
+            </div>
+            <p className="text-xs text-zinc-400 mt-0.5">
+              {backupAge.lastIso
+                ? `Último respaldo JSON: ${new Date(backupAge.lastIso).toLocaleDateString('es-MX', {
+                    day: 'numeric',
+                    month: 'short',
+                    year: 'numeric',
+                  })}${backupAge.daysSince !== null ? ` (hace ${backupAge.daysSince} ${backupAge.daysSince === 1 ? 'día' : 'días'})` : ''}`
+                : 'Último respaldo JSON: Sin respaldo previo'}
+            </p>
+            {backupFeedback && (
+              <p
+                role="status"
+                className={`text-[11px] font-semibold mt-1 ${
+                  backupFeedback.type === 'ok' ? 'text-[#a3e635]' : 'text-rose-400'
+                }`}
+              >
+                {backupFeedback.message}
+              </p>
+            )}
+          </div>
+        </div>
+
+        <button
+          type="button"
+          onClick={handleExportJson}
+          className="min-h-[40px] inline-flex items-center justify-center gap-2 rounded-xl bg-[#a3e635] hover:bg-[#bef264] px-4 text-xs font-extrabold text-[#0A0B0D] active:scale-[0.98] transition-all shrink-0"
+        >
+          <Download className="w-4 h-4" />
+          Exportar respaldo JSON
+        </button>
+      </section>
+
       {/* 3. PANEL DE RECUPERACIÓN MUSCULAR (Prominent at top or dedicated section) */}
       <section className="rounded-3xl border border-[#222631] bg-[#12141A] p-5 space-y-4">
         <div className="flex flex-wrap items-start justify-between gap-3">
@@ -1117,6 +1185,7 @@ export const PerfilTab: React.FC<PerfilTabProps> = ({
 
       {/* RECORDATORIOS INTELIGENTES Y PUSH */}
       <PushNotificationsCard
+        profileId={activeProfileId}
         isHydrated={isHydrated}
         workouts={database.workouts}
         cardioSessions={database.cardioSessions ?? []}

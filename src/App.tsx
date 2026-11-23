@@ -1,16 +1,14 @@
-import { Suspense, lazy, useEffect, useMemo, useRef, useState } from 'react';
+import { Suspense, lazy, useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   BatteryLow,
   BellRing,
+  Camera,
   Check,
-  Droplets,
   Dumbbell,
   HeartPulse,
   LayoutGrid,
-  Moon,
   Music2,
   Plus,
-  TrendingUp,
   User,
   Users,
   Utensils,
@@ -21,15 +19,20 @@ import { InlineDeleteConfirmButton } from './components/InlineDeleteConfirmButto
 import { MusicPlayerBar } from './components/MusicPlayerBar';
 import { OfflineIndicator } from './components/OfflineIndicator';
 import { PWAInstallButton } from './components/PWAInstallButton';
+import { QuickActionSheet } from './components/QuickActionSheet';
+import type { SaludHubSection } from './components/SaludHub';
+import { calculateNutritionTargets } from './data/foods';
 import { useHardwareManager } from './hooks/useHardwareManager';
 import {
+  computeDailyExerciseBurn,
   computeRecoveryIndex0To100,
   recalculateNutritionAfterWeighIn,
 } from './lib/crossModuleIntelligence';
+import { triggerHaptic } from './lib/haptics';
 import { applyWorkoutFatigue, createInitialMuscleFatigue } from './lib/recovery';
 
-const SaludTab = lazy(() =>
-  import('./components/SaludTab').then((m) => ({ default: m.SaludTab })),
+const SaludHub = lazy(() =>
+  import('./components/SaludHub').then((m) => ({ default: m.SaludHub })),
 );
 const EntrenarTab = lazy(() =>
   import('./components/EntrenarTab').then((m) => ({ default: m.EntrenarTab })),
@@ -37,27 +40,25 @@ const EntrenarTab = lazy(() =>
 const NutricionTab = lazy(() =>
   import('./components/NutricionTab').then((m) => ({ default: m.NutricionTab })),
 );
-const HidratacionTab = lazy(() =>
-  import('./components/HidratacionTab').then((m) => ({
-    default: m.HidratacionTab,
-  })),
-);
-const ProgresoTab = lazy(() =>
-  import('./components/ProgresoTab').then((m) => ({ default: m.ProgresoTab })),
-);
 const PerfilTab = lazy(() =>
   import('./components/PerfilTab').then((m) => ({ default: m.PerfilTab })),
-);
-const SleepRecoverySection = lazy(() =>
-  import('./components/SleepRecoverySection').then((m) => ({
-    default: m.SleepRecoverySection,
-  })),
 );
 const SmartScaleModal = lazy(() =>
   import('./components/SmartScaleModal').then((m) => ({
     default: m.SmartScaleModal,
   })),
 );
+const PlateScannerModal = lazy(() =>
+  import('./components/PlateScannerModal').then((m) => ({
+    default: m.PlateScannerModal,
+  })),
+);
+const QuickOnboardingModal = lazy(() =>
+  import('./components/QuickOnboardingModal').then((m) => ({
+    default: m.QuickOnboardingModal,
+  })),
+);
+import type { QuickOnboardingResult } from './components/QuickOnboardingModal';
 
 const DarkTabSkeleton = () => (
   <div className="space-y-4 animate-pulse" aria-busy="true" aria-label="Cargando módulo">
@@ -88,10 +89,12 @@ import {
   getActiveProfileId,
   getTodayIsoDate,
   isDatabaseHydrated,
+  isProfileUncalibrated,
   loadAppDatabase,
   loadProfileRegistry,
   persistProfileDatabaseImmediate,
   saveAppDatabase,
+  saveCustomGoalToLocal,
   saveProfileRegistry,
   scheduleSaveAppDatabase,
   setActiveProfileId,
@@ -124,6 +127,7 @@ import {
   reconcilePushActivityState,
 } from './lib/pushNotifications';
 import { convertSleepToReadiness } from './lib/sleepEngine';
+import { evaluateWorkoutPRs } from './lib/progressiveOverload';
 import type {
   ActiveFastState,
   ActiveWorkout,
@@ -149,38 +153,86 @@ import type {
   WorkoutSession,
 } from './types/fitness';
 
-const TABS: {
-  id: TabId;
+type PrimaryDockTabId = 'dashboard' | 'entrenar' | 'nutricion' | 'salud';
+
+const DOCK_LEFT_TABS: {
+  id: PrimaryDockTabId;
   label: string;
   Icon: React.ComponentType<{ className?: string }>;
 }[] = [
-  { id: 'dashboard', label: 'Dashboard', Icon: LayoutGrid },
-  { id: 'salud', label: 'Salud', Icon: HeartPulse },
+  { id: 'dashboard', label: 'Hoy', Icon: LayoutGrid },
   { id: 'entrenar', label: 'Entrenar', Icon: Dumbbell },
-  { id: 'nutricion', label: 'Nutrición', Icon: Utensils },
-  { id: 'hidratacion', label: 'Hidratación', Icon: Droplets },
-  { id: 'sueno', label: 'Sueño', Icon: Moon },
-  { id: 'progreso', label: 'Progreso', Icon: TrendingUp },
-  { id: 'perfil', label: 'Perfil', Icon: User },
 ];
 
-const VALID_TAB_IDS = new Set<TabId>(TABS.map((t) => t.id));
+const DOCK_RIGHT_TABS: {
+  id: PrimaryDockTabId;
+  label: string;
+  Icon: React.ComponentType<{ className?: string }>;
+}[] = [
+  { id: 'nutricion', label: 'Nutrición', Icon: Utensils },
+  { id: 'salud', label: 'Salud', Icon: HeartPulse },
+];
 
-function getInitialTabFromUrl(): TabId {
-  if (typeof window === 'undefined') return 'entrenar';
+const ALL_VALID_TAB_IDS = new Set<TabId>([
+  'dashboard',
+  'salud',
+  'entrenar',
+  'nutricion',
+  'hidratacion',
+  'sueno',
+  'progreso',
+  'perfil',
+]);
+
+function mapTabIdToNavigation(rawTab: TabId): {
+  tab: 'dashboard' | 'entrenar' | 'nutricion' | 'salud' | 'perfil';
+  saludSection?: SaludHubSection;
+} {
+  if (rawTab === 'hidratacion') {
+    return { tab: 'salud', saludSection: 'hidratacion' };
+  }
+  if (rawTab === 'sueno') {
+    return { tab: 'salud', saludSection: 'sueno' };
+  }
+  if (rawTab === 'progreso') {
+    return { tab: 'salud', saludSection: 'progreso' };
+  }
+  if (rawTab === 'salud') {
+    return { tab: 'salud' };
+  }
+  return { tab: rawTab };
+}
+
+function getInitialNavigationFromUrl(): {
+  tab: 'dashboard' | 'entrenar' | 'nutricion' | 'salud' | 'perfil';
+  saludSection: SaludHubSection;
+} {
+  if (typeof window === 'undefined') {
+    return { tab: 'dashboard', saludSection: 'biometria' };
+  }
   try {
     const raw = new URLSearchParams(window.location.search).get('tab');
-    if (raw && VALID_TAB_IDS.has(raw as TabId)) {
-      return raw as TabId;
+    if (raw && ALL_VALID_TAB_IDS.has(raw as TabId)) {
+      const mapped = mapTabIdToNavigation(raw as TabId);
+      return {
+        tab: mapped.tab,
+        saludSection: mapped.saludSection ?? 'biometria',
+      };
     }
   } catch {
     // Ignore URL parsing errors
   }
-  return 'entrenar';
+  return { tab: 'dashboard', saludSection: 'biometria' };
 }
 
 export default function App() {
-  const [activeTab, setActiveTab] = useState<TabId>(() => getInitialTabFromUrl());
+  const initialNav = useMemo(() => getInitialNavigationFromUrl(), []);
+  const [activeTab, setActiveTab] = useState<
+    'dashboard' | 'entrenar' | 'nutricion' | 'salud' | 'perfil'
+  >(initialNav.tab);
+  const [saludSection, setSaludSection] = useState<SaludHubSection>(
+    initialNav.saludSection,
+  );
   const [profileSlots, setProfileSlots] = useState<ProfileSlot[]>(DEFAULT_PROFILE_SLOTS);
   const [activeProfileId, setActiveProfileIdState] = useState<string>(() =>
     getActiveProfileId(),
@@ -190,6 +242,9 @@ export default function App() {
   const [database, setDatabase] = useState<AppDatabase>(() => createInitialDatabase());
   const [isLoaded, setIsLoaded] = useState(false);
   const [isScaleModalOpen, setIsScaleModalOpen] = useState(false);
+  const [isQuickActionOpen, setIsQuickActionOpen] = useState(false);
+  const [isQuickPlateScannerOpen, setIsQuickPlateScannerOpen] = useState(false);
+  const [isQuickOnboardingOpen, setIsQuickOnboardingOpen] = useState(false);
   const [isMiniPlayerVisible, setIsMiniPlayerVisible] = useState(false);
   const [isMusicPlaying, setIsMusicPlaying] = useState(false);
   const [hasMusicTracks, setHasMusicTracks] = useState(false);
@@ -210,6 +265,25 @@ export default function App() {
   const profileMenuRef = useRef<HTMLDivElement | null>(null);
   const databaseRef = useRef(database);
   databaseRef.current = database;
+  const autoPromptedProfilesRef = useRef<Set<string>>(new Set());
+
+  const navigateToTab = useCallback(
+    (rawTab: TabId, options?: { defaultSaludSection?: SaludHubSection }) => {
+      const mapped = mapTabIdToNavigation(rawTab);
+      if (mapped.saludSection) {
+        setSaludSection(mapped.saludSection);
+      } else if (mapped.tab === 'salud' && options?.defaultSaludSection) {
+        setSaludSection(options.defaultSaludSection);
+      }
+      setActiveTab((prev) => {
+        if (prev !== mapped.tab || Boolean(mapped.saludSection)) {
+          triggerHaptic('light');
+        }
+        return mapped.tab;
+      });
+    },
+    [],
+  );
 
   const activeProfileLabel = useMemo(
     () =>
@@ -221,6 +295,67 @@ export default function App() {
     () => computeRecoveryIndex0To100(database),
     [database],
   );
+
+  const todayIsoForQuickActions = getTodayIsoDate();
+  const latestWeightKg = useMemo(() => {
+    const weights = database.bodyWeights ?? [];
+    if (weights.length > 0) {
+      return weights[weights.length - 1].weightKg;
+    }
+    return database.profile.weightKg;
+  }, [database.bodyWeights, database.profile.weightKg]);
+
+  const quickScannerDailyContext = useMemo(() => {
+    const today = getTodayIsoDate();
+    const baseTargets = calculateNutritionTargets(database.profile);
+    const activeCalorieTarget =
+      database.adaptiveNutrition?.calorieTarget ?? baseTargets.calories;
+    const activeProteinTarget =
+      database.adaptiveNutrition?.proteinG ?? baseTargets.proteinG;
+    const activeCarbsTarget =
+      database.adaptiveNutrition?.carbsG ?? baseTargets.carbsG;
+    const activeFatTarget =
+      database.adaptiveNutrition?.fatG ?? baseTargets.fatG;
+
+    const exerciseBurn = computeDailyExerciseBurn(
+      database.profile,
+      database.workouts,
+      database.cardioSessions ?? [],
+      database.hiitSessions ?? [],
+      today,
+    );
+
+    const todayFoods = database.foodLogs.filter((f) => f.date === today);
+    let consumedCalories = 0;
+    let consumedProteinG = 0;
+    let consumedCarbsG = 0;
+    let consumedFatG = 0;
+    for (const f of todayFoods) {
+      consumedCalories += f.calories;
+      consumedProteinG += f.proteinG;
+      consumedCarbsG += f.carbsG;
+      consumedFatG += f.fatG;
+    }
+
+    return {
+      calorieTarget: activeCalorieTarget + exerciseBurn.totalExerciseKcal,
+      consumedCalories: Math.round(consumedCalories),
+      proteinTargetG: activeProteinTarget,
+      consumedProteinG: Math.round(consumedProteinG),
+      carbsTargetG: activeCarbsTarget,
+      consumedCarbsG: Math.round(consumedCarbsG),
+      fatTargetG: activeFatTarget,
+      consumedFatG: Math.round(consumedFatG),
+      goal: database.profile.goal,
+    };
+  }, [
+    database.profile,
+    database.adaptiveNutrition,
+    database.workouts,
+    database.cardioSessions,
+    database.hiitSessions,
+    database.foodLogs,
+  ]);
 
   const lowPower = useLowPowerMode();
   const prevLowPowerRef = useRef(lowPower.isLowPower);
@@ -241,16 +376,16 @@ export default function App() {
       if (
         data?.type === 'NAVIGATE_TAB' &&
         typeof data.tab === 'string' &&
-        VALID_TAB_IDS.has(data.tab as TabId)
+        ALL_VALID_TAB_IDS.has(data.tab as TabId)
       ) {
-        setActiveTab(data.tab as TabId);
+        navigateToTab(data.tab as TabId);
       }
     };
     navigator.serviceWorker.addEventListener('message', handleSwMessage);
     return () => {
       navigator.serviceWorker.removeEventListener('message', handleSwMessage);
     };
-  }, []);
+  }, [navigateToTab]);
 
   // Sync active profile's Low Power preference & flush batched IDB writes when returning to normal mode
   useEffect(() => {
@@ -390,6 +525,16 @@ export default function App() {
     };
   }, []);
 
+  // Auto-open 30s onboarding once per uncalibrated profile load
+  useEffect(() => {
+    if (!isLoaded || !isDatabaseHydrated(activeProfileId)) return;
+    if (autoPromptedProfilesRef.current.has(activeProfileId)) return;
+    if (isProfileUncalibrated(database, activeProfileId)) {
+      autoPromptedProfilesRef.current.add(activeProfileId);
+      setIsQuickOnboardingOpen(true);
+    }
+  }, [isLoaded, activeProfileId, database]);
+
   // Close profile menu on outside click
   useEffect(() => {
     if (!isProfileMenuOpen) return undefined;
@@ -453,6 +598,7 @@ export default function App() {
   const handleSelectProfile = async (slotId: string) => {
     setIsProfileMenuOpen(false);
     if (slotId === activeProfileIdRef.current) return;
+    triggerHaptic('light');
 
     await flushPendingAppDatabaseSaves(activeProfileIdRef.current);
     cancelCoachSpeech();
@@ -497,6 +643,7 @@ export default function App() {
   };
 
   const handleStartWorkout = (workout: ActiveWorkout) => {
+    triggerHaptic('medium');
     commitDatabase((prev) => ({
       ...prev,
       activeWorkout: workout,
@@ -511,15 +658,19 @@ export default function App() {
   };
 
   const handleCompleteWorkout = (workout: ActiveWorkout) => {
+    triggerHaptic('success');
     const completedAt = new Date().toISOString();
     const startMs = Date.parse(workout.startedAt);
     const durationSec = Number.isNaN(startMs)
       ? 0
       : Math.max(60, Math.floor((Date.now() - startMs) / 1000));
 
+    const prEvaluation = evaluateWorkoutPRs(workout, database.workouts);
+    const annotatedExercises = prEvaluation.exercises;
+
     let completedSets = 0;
     let totalVolumeKg = 0;
-    for (const ex of workout.exercises) {
+    for (const ex of annotatedExercises) {
       for (const s of ex.sets) {
         if (s.completed) {
           completedSets += 1;
@@ -530,7 +681,7 @@ export default function App() {
 
     const { updatedMap, impact } = applyWorkoutFatigue(
       database.muscleFatigue,
-      workout.exercises,
+      annotatedExercises,
       completedAt,
     );
 
@@ -542,8 +693,11 @@ export default function App() {
       durationSec,
       totalVolumeKg: Math.round(totalVolumeKg),
       completedSets,
-      exercises: workout.exercises,
+      exercises: annotatedExercises,
       fatigueImpact: impact,
+      ...(prEvaluation.hasAnyPR
+        ? { isPR: true, prLabels: prEvaluation.prLabels }
+        : {}),
     };
 
     commitDatabase((prev) => ({
@@ -721,10 +875,58 @@ export default function App() {
   };
 
   const handleUpdateProfile = (profile: UserProfile) => {
+    if (typeof profile.customGoal === 'string') {
+      saveCustomGoalToLocal(activeProfileIdRef.current, profile.customGoal);
+    }
     commitDatabase((prev) => ({
       ...prev,
       profile,
     }));
+  };
+
+  const handleDismissQuickOnboarding = () => {
+    setIsQuickOnboardingOpen(false);
+    commitDatabase((prev) => ({
+      ...prev,
+      profile: {
+        ...prev.profile,
+        onboardingCompleted: true,
+      },
+    }));
+  };
+
+  const handleCompleteQuickOnboarding = (result: QuickOnboardingResult) => {
+    const todayIso = getTodayIsoDate();
+    const targetProfileId = activeProfileIdRef.current;
+    saveCustomGoalToLocal(targetProfileId, result.customGoal);
+    setIsQuickOnboardingOpen(false);
+
+    commitDatabase((prev) => {
+      const updatedProfile: UserProfile = {
+        ...prev.profile,
+        goal: result.goal,
+        customGoal: result.customGoal.trim() || undefined,
+        equipment: result.equipment,
+        preferredRestSec: result.preferredRestSec,
+        autoStartRest: result.autoStartRest,
+        trainingDaysPerWeek: result.trainingDaysPerWeek,
+        weightKg: result.weightKg,
+        heightCm: result.heightCm,
+        weightUnit: result.weightUnit,
+        onboardingCompleted: true,
+      };
+      const nextWeights = [
+        ...prev.bodyWeights.filter((b) => b.date !== todayIso),
+        { id: `bw_${Date.now()}`, date: todayIso, weightKg: result.weightKg },
+      ].sort((a, b) => a.date.localeCompare(b.date));
+
+      const nextBase: AppDatabase = {
+        ...prev,
+        profile: updatedProfile,
+        bodyWeights: nextWeights,
+      };
+      return recalculateNutritionAfterWeighIn(nextBase, result.weightKg);
+    });
   };
 
   const handleResetMuscleFatigue = () => {
@@ -1197,18 +1399,22 @@ export default function App() {
     <div className="min-h-[100dvh] bg-[#0A0B0D] text-[#F4F5F7] flex flex-col">
       <OfflineIndicator />
 
-      {/* Compact Top Bar with Quick Profile Selector */}
+      {/* Compact Top Bar with Quick Profile Selector + Perfil access */}
       <header className="pt-safe border-b border-white/5 bg-[#0A0B0D] relative z-30">
-        <div className="max-w-5xl mx-auto px-4 sm:px-6 h-14 flex items-center justify-between gap-2">
-          <span className="text-2xl font-extrabold font-display tracking-tight text-white whitespace-nowrap shrink-0">
+        <div className="max-w-5xl mx-auto px-3 sm:px-6 h-14 flex items-center justify-between gap-1.5 sm:gap-2">
+          <button
+            type="button"
+            onClick={() => navigateToTab('dashboard')}
+            className="text-xl sm:text-2xl font-extrabold font-display tracking-tight text-white whitespace-nowrap shrink-0 text-left"
+          >
             Pulso<span className="text-[#D4FF33]">Fit</span>
-          </span>
+          </button>
 
-          <div className="flex items-center gap-2 shrink-0">
+          <div className="flex items-center gap-1.5 sm:gap-2 shrink-0">
             {lowPower.isLowPower && (
               <button
                 type="button"
-                onClick={() => setActiveTab('perfil')}
+                onClick={() => navigateToTab('perfil')}
                 title="Modo Bajo Consumo activo (toca para configurar)"
                 aria-label="Modo Bajo Consumo activo"
                 className="min-h-[34px] inline-flex items-center gap-1 rounded-xl border border-amber-400/40 bg-amber-500/12 px-2 text-[10px] font-extrabold text-amber-300 hover:border-amber-300/70 transition-colors"
@@ -1227,7 +1433,7 @@ export default function App() {
               <div
                 role="tablist"
                 aria-label="Cambiar perfil activo en 1 toque"
-                className="flex items-center gap-0.5 rounded-full border border-[#252A36] bg-[#13161F] p-0.5 max-w-[180px] sm:max-w-[300px] overflow-x-auto no-scrollbar"
+                className="flex items-center gap-0.5 rounded-full border border-[#252A36] bg-[#13161F] p-0.5 max-w-[116px] sm:max-w-[260px] overflow-x-auto no-scrollbar"
               >
                 {profileSlots.map((slot) => {
                   const active = slot.id === activeProfileId;
@@ -1238,7 +1444,7 @@ export default function App() {
                       role="tab"
                       aria-selected={active}
                       onClick={() => void handleSelectProfile(slot.id)}
-                      className={`min-h-[30px] px-2.5 rounded-full text-[11px] font-extrabold whitespace-nowrap shrink-0 transition-colors ${
+                      className={`min-h-[30px] px-2 sm:px-2.5 rounded-full text-[10px] sm:text-[11px] font-extrabold whitespace-nowrap shrink-0 transition-colors ${
                         active
                           ? 'bg-[#D4FF33] text-[#0A0B0D] shadow-sm'
                           : 'text-zinc-300 hover:text-white'
@@ -1252,7 +1458,10 @@ export default function App() {
 
               <button
                 type="button"
-                onClick={() => setIsProfileMenuOpen((v) => !v)}
+                onClick={() => {
+                  triggerHaptic('light');
+                  setIsProfileMenuOpen((v) => !v);
+                }}
                 aria-expanded={isProfileMenuOpen}
                 aria-label="Administrar o agregar perfil"
                 title="Administrar perfiles"
@@ -1328,7 +1537,10 @@ export default function App() {
 
             <button
               type="button"
-              onClick={() => setOpenMusicModalTick((t) => t + 1)}
+              onClick={() => {
+                triggerHaptic('light');
+                setOpenMusicModalTick((t) => t + 1);
+              }}
               aria-label="Abrir reproductor offline y ecualizador"
               title="Reproductor de audio y EQ"
               className={`min-h-[34px] min-w-[34px] inline-flex items-center justify-center rounded-full border transition-colors shrink-0 ${
@@ -1340,6 +1552,22 @@ export default function App() {
               }`}
             >
               <Music2 className="w-3.5 h-3.5" />
+            </button>
+
+            <button
+              type="button"
+              onClick={() => navigateToTab('perfil')}
+              aria-label="Abrir Perfil y ajustes"
+              aria-current={activeTab === 'perfil' ? 'page' : undefined}
+              title={`Perfil (${activeProfileLabel})`}
+              className={`min-h-[34px] min-w-[34px] sm:px-2.5 inline-flex items-center justify-center gap-1.5 rounded-full border text-[11px] font-bold transition-colors shrink-0 ${
+                activeTab === 'perfil'
+                  ? 'border-[#D4FF33] bg-[#D4FF33]/15 text-[#D4FF33]'
+                  : 'border-[#252A36] bg-[#13161F] text-zinc-300 hover:text-white hover:border-[#D4FF33]/40'
+              }`}
+            >
+              <User className="w-3.5 h-3.5" />
+              <span className="hidden sm:inline">Perfil</span>
             </button>
 
             <PWAInstallButton variant="compact" />
@@ -1370,6 +1598,7 @@ export default function App() {
               <button
                 type="button"
                 onClick={() => {
+                  triggerHaptic('success');
                   handleAddWater(getTodayIsoDate(), 250);
                   setInAppHydrationAlert(null);
                 }}
@@ -1379,7 +1608,10 @@ export default function App() {
               </button>
               <button
                 type="button"
-                onClick={() => setInAppHydrationAlert(null)}
+                onClick={() => {
+                  triggerHaptic('light');
+                  setInAppHydrationAlert(null);
+                }}
                 aria-label="Cerrar recordatorio de agua"
                 className="min-h-[36px] min-w-[36px] rounded-xl border border-white/10 bg-white/5 flex items-center justify-center text-zinc-300 hover:text-white"
               >
@@ -1393,7 +1625,7 @@ export default function App() {
       {/* Main Scrollable Content */}
       <main
         className={`flex-1 max-w-5xl w-full mx-auto px-4 sm:px-6 pt-5 transition-[padding] duration-200 ${
-          isMiniPlayerVisible ? 'pb-40' : 'pb-24'
+          isMiniPlayerVisible ? 'pb-40' : 'pb-28'
         }`}
       >
         {!isLoaded ? (
@@ -1411,39 +1643,17 @@ export default function App() {
                 activeProfileId={activeProfileId}
                 onSelectProfile={(slotId) => void handleSelectProfile(slotId)}
                 onUpdateProfile={handleUpdateProfile}
-                onNavigateTab={setActiveTab}
+                onNavigateTab={navigateToTab}
                 onOpenScale={() => setIsScaleModalOpen(true)}
                 onAddManualSteps={handleAddManualSteps}
                 onImportManualActivity={handleImportManualActivity}
                 onUpdateCoachState={handleUpdateCoachState}
                 onToggleScheduledRestToday={handleToggleScheduledRestToday}
-                onOpenSleep={() => setActiveTab('sueno')}
-                onOpenPulse={() => setActiveTab('salud')}
+                onOpenSleep={() => navigateToTab('sueno')}
+                onOpenPulse={() => navigateToTab('salud', { defaultSaludSection: 'biometria' })}
                 onAddElectrolytesAndWater={handleAddElectrolytesAndWater}
                 onCompleteActivePause={handleCompleteActivePause}
               />
-            )}
-
-            {activeTab === 'salud' && (
-              <Suspense fallback={<DarkTabSkeleton />}>
-                <SaludTab
-                  profile={database.profile}
-                  bodyScans={database.bodyScans}
-                  bodyWeights={database.bodyWeights}
-                  pulseRecords={database.pulseHrvRecords ?? []}
-                  bloodPressureRecords={database.bloodPressureRecords ?? []}
-                  todayReadiness={database.readinessByDate?.[getTodayIsoDate()] ?? null}
-                  recoveryIndex0To100={recoveryIndexSummary.score}
-                  isHydrated={isLoaded && isDatabaseHydrated(activeProfileId)}
-                  onUpdateProfile={handleUpdateProfile}
-                  onSaveScan={handleSaveBodyScan}
-                  onOpenScale={() => setIsScaleModalOpen(true)}
-                  onSavePulseRecord={handleSavePulseRecord}
-                  onDeletePulseRecord={handleDeletePulseRecord}
-                  onSaveBloodPressureRecord={handleSaveBloodPressureRecord}
-                  onDeleteBloodPressureRecord={handleDeleteBloodPressureRecord}
-                />
-              </Suspense>
             )}
 
             {activeTab === 'entrenar' && (
@@ -1472,7 +1682,7 @@ export default function App() {
                   onCompleteWorkout={handleCompleteWorkout}
                   onDismissSummary={() => setLastCompletedSession(null)}
                   onUpdateProfile={handleUpdateProfile}
-                  onNavigateTab={setActiveTab}
+                  onNavigateTab={navigateToTab}
                   onSaveCardioSession={handleSaveCardioSession}
                   onDeleteCardioSession={handleDeleteCardioSession}
                   onDeleteHiitSession={handleDeleteHiitSession}
@@ -1482,8 +1692,8 @@ export default function App() {
                   onSaveReadiness={handleSaveReadiness}
                   onAddManualSteps={handleAddManualSteps}
                   openWalkSignal={openCardioWalkTick}
-                  onOpenSleep={() => setActiveTab('sueno')}
-                  onOpenPulse={() => setActiveTab('salud')}
+                  onOpenSleep={() => navigateToTab('sueno')}
+                  onOpenPulse={() => navigateToTab('salud', { defaultSaludSection: 'biometria' })}
                 />
               </Suspense>
             )}
@@ -1521,31 +1731,25 @@ export default function App() {
               </Suspense>
             )}
 
-            {activeTab === 'hidratacion' && (
+            {activeTab === 'salud' && (
               <Suspense fallback={<DarkTabSkeleton />}>
-                <HidratacionTab
-                  profile={database.profile}
-                  bodyWeights={database.bodyWeights}
-                  bodyScans={database.bodyScans}
-                  workouts={database.workouts}
-                  cardioSessions={database.cardioSessions ?? []}
-                  hiitSessions={database.hiitSessions ?? []}
-                  hydrationByDate={database.hydrationByDate}
-                  hydrationLogsByDate={database.hydrationLogsByDate ?? {}}
-                  hydrationSettings={
-                    database.hydrationSettings ?? {
-                      mlPerKg: 35,
-                      containerMl: 500,
-                      wakeHour: 7,
-                      sleepHour: 22,
-                      hotDayByDate: {},
-                      remindersEnabled: false,
-                    }
-                  }
-                  electrolytesByDate={database.electrolytesByDate ?? {}}
-                  activeFast={database.activeFast ?? null}
-                  fastingHistory={database.fastingHistory ?? []}
+                <SaludHub
+                  activeSection={saludSection}
+                  onSelectSection={setSaludSection}
+                  activeProfileId={activeProfileId}
+                  database={database}
+                  todayIso={getTodayIsoDate()}
+                  recoveryIndex0To100={recoveryIndexSummary.score}
+                  isHydrated={isLoaded && isDatabaseHydrated(activeProfileId)}
                   onUpdateProfile={handleUpdateProfile}
+                  onSaveScan={handleSaveBodyScan}
+                  onOpenScale={() => setIsScaleModalOpen(true)}
+                  onSavePulseRecord={handleSavePulseRecord}
+                  onDeletePulseRecord={handleDeletePulseRecord}
+                  onSaveBloodPressureRecord={handleSaveBloodPressureRecord}
+                  onDeleteBloodPressureRecord={handleDeleteBloodPressureRecord}
+                  onSaveSleepSession={handleSaveSleepSession}
+                  onDeleteSleepSession={handleDeleteSleepSession}
                   onAddWater={handleAddWater}
                   onUndoLastWater={handleUndoLastWater}
                   onDeleteWaterLog={handleDeleteWaterLog}
@@ -1553,43 +1757,8 @@ export default function App() {
                   onUpdateElectrolytes={handleUpdateElectrolytes}
                   onOpenPushSettings={() => {
                     setOpenPushTick((t) => t + 1);
-                    setActiveTab('perfil');
+                    navigateToTab('perfil');
                   }}
-                />
-              </Suspense>
-            )}
-
-            {activeTab === 'sueno' && (
-              <div className="space-y-6">
-                <div>
-                  <div className="flex items-center gap-2">
-                    <Moon className="w-6 h-6 text-[#D4FF33]" />
-                    <h1 className="text-3xl sm:text-4xl font-extrabold font-display tracking-tight text-white">
-                      Sueño y Descanso
-                    </h1>
-                  </div>
-                  <p className="mt-1 text-sm text-zinc-400">
-                    Fases de sueño (Profundo, REM, Ligero, Despierto), ciclos de 90 min e hipnograma nocturno
-                  </p>
-                </div>
-
-                <Suspense fallback={<DarkTabSkeleton />}>
-                  <SleepRecoverySection
-                    sleepSessions={database.sleepSessions ?? []}
-                    todayReadiness={database.readinessByDate?.[getTodayIsoDate()] ?? null}
-                    onSaveSleepSession={handleSaveSleepSession}
-                    onDeleteSleepSession={handleDeleteSleepSession}
-                  />
-                </Suspense>
-              </div>
-            )}
-
-            {activeTab === 'progreso' && (
-              <Suspense fallback={<DarkTabSkeleton />}>
-                <ProgresoTab
-                  database={database}
-                  profile={database.profile}
-                  onUpdateProfile={handleUpdateProfile}
                   onDeleteWorkout={handleDeleteWorkout}
                   onDeleteHiitSession={handleDeleteHiitSession}
                   onDeleteCardioSession={handleDeleteCardioSession}
@@ -1597,14 +1766,7 @@ export default function App() {
                   onDeleteBodyWeight={handleDeleteBodyWeight}
                   onDeleteFood={handleDeleteFood}
                   onDeleteFastHistory={handleDeleteFastHistory}
-                  onDeleteSleepSession={handleDeleteSleepSession}
-                  onDeletePulseRecord={handleDeletePulseRecord}
-                  onDeleteBloodPressureRecord={handleDeleteBloodPressureRecord}
-                  onDeleteWaterLog={handleDeleteWaterLog}
                   onClearDay={handleClearDay}
-                  onOpenScale={() => setIsScaleModalOpen(true)}
-                  onOpenSleep={() => setActiveTab('sueno')}
-                  onOpenPulse={() => setActiveTab('salud')}
                 />
               </Suspense>
             )}
@@ -1613,6 +1775,7 @@ export default function App() {
               <Suspense fallback={<DarkTabSkeleton />}>
                 <PerfilTab
                   database={database}
+                  activeProfileId={activeProfileId}
                   activeProfileLabel={activeProfileLabel}
                   onUpdateProfile={handleUpdateProfile}
                   onResetMuscleFatigue={handleResetMuscleFatigue}
@@ -1640,6 +1803,7 @@ export default function App() {
                   onUpdateHydrationSettings={handleUpdateHydrationSettings}
                   isHydrated={isLoaded && isDatabaseHydrated(activeProfileId)}
                   openPushSettingsSignal={openPushTick}
+                  onOpenQuickOnboarding={() => setIsQuickOnboardingOpen(true)}
                 />
               </Suspense>
             )}
@@ -1666,8 +1830,63 @@ export default function App() {
         </Suspense>
       )}
 
-      {/* Unified Fixed Bottom Dock: Mini-Player above 8-Tab Navigation */}
-      <div className="fixed bottom-0 inset-x-0 z-40 flex flex-col pb-[env(safe-area-inset-bottom)] bg-[#0A0B0D]/95 backdrop-blur-md">
+      {isQuickPlateScannerOpen && (
+        <Suspense
+          fallback={
+            <div className="fixed inset-0 z-50 bg-black/75 backdrop-blur-sm flex items-center justify-center p-4">
+              <div className="w-full max-w-lg h-80 rounded-3xl border border-zinc-800 bg-zinc-950 flex flex-col items-center justify-center gap-3 animate-pulse">
+                <Camera className="w-7 h-7 text-lime-400" />
+                <span className="text-xs font-bold text-zinc-300">
+                  Preparando Escáner de Plato IA...
+                </span>
+              </div>
+            </div>
+          }
+        >
+          <PlateScannerModal
+            isOpen={isQuickPlateScannerOpen}
+            initialMealType="almuerzo"
+            selectedDate={todayIsoForQuickActions}
+            dailyContext={quickScannerDailyContext}
+            onClose={() => setIsQuickPlateScannerOpen(false)}
+            onSaveEntries={(entries) => {
+              triggerHaptic('success');
+              for (const entry of entries) {
+                handleAddFood(entry);
+              }
+            }}
+          />
+        </Suspense>
+      )}
+
+      {isQuickOnboardingOpen && (
+        <Suspense fallback={null}>
+          <QuickOnboardingModal
+            isOpen={isQuickOnboardingOpen}
+            profile={database.profile}
+            activeProfileLabel={activeProfileLabel}
+            onClose={handleDismissQuickOnboarding}
+            onComplete={handleCompleteQuickOnboarding}
+          />
+        </Suspense>
+      )}
+
+      <QuickActionSheet
+        isOpen={isQuickActionOpen}
+        profile={database.profile}
+        latestWeightKg={latestWeightKg}
+        todayWaterMl={database.hydrationByDate[todayIsoForQuickActions] ?? 0}
+        todayReadiness={database.readinessByDate?.[todayIsoForQuickActions] ?? null}
+        onClose={() => setIsQuickActionOpen(false)}
+        onAddWater250Ml={(dateIso) => handleAddWater(dateIso, 250)}
+        onOpenPlateScanner={() => setIsQuickPlateScannerOpen(true)}
+        onOpenSmartScale={() => setIsScaleModalOpen(true)}
+        onLogWeight={handleLogBodyWeight}
+        onSaveReadiness={handleSaveReadiness}
+      />
+
+      {/* Unified Fixed Bottom Dock: Mini-Player above 5-Slot Flagship Navigation */}
+      <div className="fixed bottom-0 inset-x-0 z-40 flex flex-col pb-[env(safe-area-inset-bottom)]">
         <MusicPlayerBar
           openModalSignal={openMusicModalTick}
           onMiniPlayerVisibleChange={setIsMiniPlayerVisible}
@@ -1677,37 +1896,81 @@ export default function App() {
           }}
         />
 
-        {/* Scrollable 8-Tab Mobile Bottom Navigation */}
+        {/* Flagship 5-Slot Mobile Bottom Bar: Hoy · Entrenar · (+) · Nutrición · Salud */}
         <nav
           aria-label="Navegación principal"
-          className="w-full border-t border-[#1E222B] bg-[#0A0B0D]/95"
+          className="w-full backdrop-blur-xl bg-zinc-950/90 border-t border-zinc-800/80"
         >
-          <div className="max-w-4xl mx-auto flex items-center overflow-x-auto no-scrollbar w-full h-[70px] px-2 gap-1 sm:justify-around">
-            {TABS.map(({ id, label, Icon }) => {
+          <div className="max-w-lg mx-auto grid grid-cols-5 items-center h-[68px] px-1.5 sm:px-3">
+            {DOCK_LEFT_TABS.map(({ id, label, Icon }) => {
               const active = activeTab === id;
               const hasWorkoutBadge = id === 'entrenar' && database.activeWorkout !== null;
               return (
                 <button
                   key={id}
                   type="button"
-                  onClick={() => setActiveTab(id)}
+                  onClick={() => navigateToTab(id)}
                   aria-current={active ? 'page' : undefined}
-                  className={`relative flex flex-col items-center justify-center shrink-0 min-w-[74px] sm:min-w-0 sm:flex-1 h-14 px-1.5 rounded-xl transition-colors active:scale-95 ${
-                    active ? 'text-[#D4FF33] bg-[#D4FF33]/10' : 'text-zinc-400 hover:text-zinc-200'
+                  className={`relative flex flex-col items-center justify-center h-13 px-1 rounded-2xl transition-colors active:scale-95 ${
+                    active
+                      ? 'text-lime-400 bg-lime-400/10'
+                      : 'text-zinc-400 hover:text-zinc-100'
                   }`}
                 >
                   <div className="relative">
-                    <Icon className="w-[18px] h-[18px]" />
+                    <Icon className="w-[19px] h-[19px]" />
                     {hasWorkoutBadge && (
                       <span
                         aria-label="Entrenamiento activo"
-                        className="absolute -top-1 -right-2.5 text-[8px] font-extrabold text-[#0A0B0D] bg-[#D4FF33] px-1 rounded"
+                        className="absolute -top-1.5 -right-3 text-[8px] font-extrabold text-zinc-950 bg-lime-400 px-1 rounded"
                       >
                         ON
                       </span>
                     )}
                   </div>
-                  <span className="text-[10px] leading-none font-semibold tracking-tight mt-1 whitespace-nowrap text-center">
+                  <span className="text-[10px] leading-none font-bold tracking-tight mt-1 whitespace-nowrap">
+                    {label}
+                  </span>
+                </button>
+              );
+            })}
+
+            {/* Central Prominent Quick Action Trigger (+) */}
+            <div className="flex items-center justify-center">
+              <button
+                type="button"
+                onClick={() => {
+                  triggerHaptic('medium');
+                  setIsQuickActionOpen((v) => !v);
+                }}
+                aria-expanded={isQuickActionOpen}
+                aria-label="Abrir acciones rápidas"
+                className="w-13 h-13 -mt-3.5 rounded-full bg-lime-400 text-zinc-950 shadow-lg shadow-lime-400/25 flex items-center justify-center hover:bg-lime-300 active:scale-90 transition-all"
+              >
+                <Plus
+                  className={`w-6 h-6 stroke-[2.6] transition-transform duration-200 ${
+                    isQuickActionOpen ? 'rotate-45' : ''
+                  }`}
+                />
+              </button>
+            </div>
+
+            {DOCK_RIGHT_TABS.map(({ id, label, Icon }) => {
+              const active = activeTab === id;
+              return (
+                <button
+                  key={id}
+                  type="button"
+                  onClick={() => navigateToTab(id)}
+                  aria-current={active ? 'page' : undefined}
+                  className={`relative flex flex-col items-center justify-center h-13 px-1 rounded-2xl transition-colors active:scale-95 ${
+                    active
+                      ? 'text-lime-400 bg-lime-400/10'
+                      : 'text-zinc-400 hover:text-zinc-100'
+                  }`}
+                >
+                  <Icon className="w-[19px] h-[19px]" />
+                  <span className="text-[10px] leading-none font-bold tracking-tight mt-1 whitespace-nowrap">
                     {label}
                   </span>
                 </button>

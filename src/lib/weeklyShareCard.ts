@@ -11,6 +11,9 @@ import {
 } from './units';
 import type { AppDatabase, UserProfile } from '../types/fitness';
 
+const LIME_ACCENT = '#a3e635';
+const GOLD_PR = '#fbbf24';
+
 export interface WeeklySummarySnapshot {
   startDateIso: string;
   endDateIso: string;
@@ -20,6 +23,8 @@ export interface WeeklySummarySnapshot {
   strengthCount: number;
   cardioCount: number;
   hiitCount: number;
+  prsCount: number;
+  topPrLabel: string | null;
   totalDistanceKm: number;
   netWeightDeltaKg: number | null;
   latestWeightKg: number | null;
@@ -85,17 +90,51 @@ export function computeWeeklySummarySnapshot(
   }
   totalDistanceKm = Math.round(totalDistanceKm * 100) / 100;
 
-  // Sessions count across workouts, cardio, HIIT
+  // Sessions count + PRs across workouts, cardio, HIIT
   const strengthIds = new Set<string>();
+  let prsCount = 0;
+  let topPrLabel: string | null = null;
+
   for (const w of db.workouts ?? []) {
     const key = getLocalDateKey(w.completedAt);
-    if (weekSet.has(key)) strengthIds.add(w.id || `${w.completedAt}_${w.title}`);
+    if (weekSet.has(key)) {
+      strengthIds.add(w.id || `${w.completedAt}_${w.title}`);
+      let workoutPrSets = 0;
+      for (const ex of w.exercises ?? []) {
+        for (const s of ex.sets ?? []) {
+          if (s.isPR) {
+            workoutPrSets += 1;
+            if (!topPrLabel) {
+              topPrLabel = `${ex.name.slice(0, 18)}${s.prLabels?.[0] ? ` · ${s.prLabels[0]}` : ''}`;
+            }
+          }
+        }
+      }
+      if (workoutPrSets > 0) {
+        prsCount += workoutPrSets;
+      } else if (w.isPR) {
+        prsCount += 1;
+        if (!topPrLabel) {
+          topPrLabel = w.prLabels?.[0] || w.title.slice(0, 20);
+        }
+      }
+    }
   }
+
   const cardioIds = new Set<string>();
   for (const c of db.cardioSessions ?? []) {
     const key = getLocalDateKey(c.date || c.completedAt);
-    if (weekSet.has(key)) cardioIds.add(c.id || `${c.completedAt}_${c.activityType}`);
+    if (weekSet.has(key)) {
+      cardioIds.add(c.id || `${c.completedAt}_${c.activityType}`);
+      if (c.isPR) {
+        prsCount += 1;
+        if (!topPrLabel) {
+          topPrLabel = c.prLabels?.[0] || 'PR en Cardio GPS';
+        }
+      }
+    }
   }
+
   const hiitIds = new Set<string>();
   for (const h of db.hiitSessions ?? []) {
     const key = getLocalDateKey(h.date || h.completedAt);
@@ -170,8 +209,8 @@ export function computeWeeklySummarySnapshot(
             10,
         ) / 10;
       avgSleepQualityPct = Math.round(
-        (readinessSleep.reduce((s, r) => s + (r.sleepQuality || 3) * 20, 0) /
-          readinessSleep.length),
+        readinessSleep.reduce((s, r) => s + (r.sleepQuality || 3) * 20, 0) /
+          readinessSleep.length,
       );
     }
   }
@@ -215,6 +254,8 @@ export function computeWeeklySummarySnapshot(
     strengthCount,
     cardioCount,
     hiitCount,
+    prsCount,
+    topPrLabel,
     totalDistanceKm,
     netWeightDeltaKg,
     latestWeightKg,
@@ -246,109 +287,143 @@ export async function renderWeeklyShareCardDataUrl(
     throw new Error('No se pudo inicializar el lienzo de la Tarjeta Semanal.');
   }
 
-  // Deep obsidian background
-  ctx.fillStyle = '#090B0E';
+  // Deep high-contrast obsidian background
+  ctx.fillStyle = '#08090C';
   ctx.fillRect(0, 0, width, height);
 
-  // Subtle emerald + lime glow accents (glassmorphism atmosphere)
-  const glowTop = ctx.createRadialGradient(840, 140, 20, 840, 140, 560);
-  glowTop.addColorStop(0, 'rgba(212, 255, 51, 0.16)');
-  glowTop.addColorStop(1, 'rgba(9, 11, 14, 0)');
+  // Subtle electric lime + emerald athletic atmosphere
+  const glowTop = ctx.createRadialGradient(860, 130, 20, 860, 130, 580);
+  glowTop.addColorStop(0, 'rgba(163, 230, 53, 0.16)');
+  glowTop.addColorStop(1, 'rgba(8, 9, 12, 0)');
   ctx.fillStyle = glowTop;
   ctx.fillRect(0, 0, width, height);
 
   const glowBottom = ctx.createRadialGradient(220, 1140, 20, 220, 1140, 520);
   glowBottom.addColorStop(0, 'rgba(16, 185, 129, 0.14)');
-  glowBottom.addColorStop(1, 'rgba(9, 11, 14, 0)');
+  glowBottom.addColorStop(1, 'rgba(8, 9, 12, 0)');
   ctx.fillStyle = glowBottom;
   ctx.fillRect(0, 0, width, height);
 
-  // Main glass container
-  drawRoundedRect(ctx, 48, 48, width - 96, height - 96, 44);
-  ctx.fillStyle = 'rgba(18, 21, 28, 0.94)';
+  // Main obsidian frame
+  drawRoundedRect(ctx, 44, 44, width - 88, height - 88, 40);
+  ctx.fillStyle = '#101218';
   ctx.fill();
   ctx.lineWidth = 2;
-  ctx.strokeStyle = 'rgba(255, 255, 255, 0.10)';
+  ctx.strokeStyle = '#27272A';
   ctx.stroke();
 
-  // Header Brand
-  ctx.font = '800 44px system-ui, -apple-system, sans-serif';
-  ctx.fillStyle = '#FFFFFF';
-  ctx.fillText('Pulso', 96, 134);
-  const pulsoW = ctx.measureText('Pulso').width;
-  ctx.fillStyle = '#D4FF33';
-  ctx.fillText('Fit', 96 + pulsoW, 134);
+  // Top speed accent bar
+  drawRoundedRect(ctx, 96, 78, 72, 6, 3);
+  ctx.fillStyle = LIME_ACCENT;
+  ctx.fill();
 
-  ctx.font = '600 24px system-ui, -apple-system, sans-serif';
-  ctx.fillStyle = '#9CA3AF';
-  ctx.fillText('RESUMEN SEMANAL · 7 DÍAS', 96, 176);
+  // Bold PULSOFIT wordmark
+  ctx.font = '900 44px system-ui, -apple-system, sans-serif';
+  ctx.fillStyle = '#FFFFFF';
+  ctx.fillText('PULSO', 96, 134);
+  const pulsoW = ctx.measureText('PULSO').width;
+  ctx.fillStyle = LIME_ACCENT;
+  ctx.fillText('FIT', 96 + pulsoW, 134);
+
+  ctx.font = '700 22px system-ui, -apple-system, sans-serif';
+  ctx.fillStyle = '#A1A1AA';
+  ctx.fillText('RESUMEN SEMANAL · 7 DÍAS', 96, 174);
 
   ctx.textAlign = 'right';
-  ctx.font = '700 24px system-ui, -apple-system, sans-serif';
-  ctx.fillStyle = '#E5E7EB';
-  ctx.fillText(profile.name || 'Atleta PulsoFit', width - 96, 132);
-  ctx.font = '600 22px ui-monospace, SFMono-Regular, Menlo, monospace';
-  ctx.fillStyle = '#D4FF33';
-  ctx.fillText(snapshot.dateRangeLabel, width - 96, 172);
+  ctx.font = '700 23px system-ui, -apple-system, sans-serif';
+  ctx.fillStyle = '#E4E4E7';
+  ctx.fillText((profile.name || 'Atleta PulsoFit').slice(0, 24), width - 96, 130);
+  ctx.font = '700 21px ui-monospace, SFMono-Regular, Menlo, monospace';
+  ctx.fillStyle = LIME_ACCENT;
+  ctx.fillText(snapshot.dateRangeLabel.toUpperCase(), width - 96, 170);
   ctx.textAlign = 'left';
 
   // Divider
-  ctx.strokeStyle = '#232836';
+  ctx.strokeStyle = '#27272A';
   ctx.lineWidth = 2;
   ctx.beginPath();
-  ctx.moveTo(96, 210);
-  ctx.lineTo(width - 96, 210);
+  ctx.moveTo(96, 206);
+  ctx.lineTo(width - 96, 206);
   ctx.stroke();
 
-  // Hero Streak Card
-  drawRoundedRect(ctx, 96, 248, width - 192, 236, 32);
-  const heroGrad = ctx.createLinearGradient(96, 248, width - 96, 484);
-  heroGrad.addColorStop(0, '#141B14');
-  heroGrad.addColorStop(1, '#0E1218');
+  // Hero Streak + PR Badge Card
+  drawRoundedRect(ctx, 96, 240, width - 192, 244, 32);
+  const heroGrad = ctx.createLinearGradient(96, 240, width - 96, 484);
+  heroGrad.addColorStop(0, '#131A12');
+  heroGrad.addColorStop(1, '#090B0F');
   ctx.fillStyle = heroGrad;
   ctx.fill();
   ctx.lineWidth = 2;
-  ctx.strokeStyle = 'rgba(212, 255, 51, 0.35)';
+  ctx.strokeStyle = 'rgba(163, 230, 53, 0.42)';
   ctx.stroke();
 
-  ctx.font = '700 22px system-ui, -apple-system, sans-serif';
-  ctx.fillStyle = '#A3E635';
-  ctx.fillText('RACHA ACTIVA', 136, 304);
+  // Streak Pill
+  drawRoundedRect(ctx, 134, 274, 210, 36, 10);
+  ctx.fillStyle = 'rgba(163, 230, 53, 0.16)';
+  ctx.fill();
+  ctx.font = '800 18px system-ui, -apple-system, sans-serif';
+  ctx.fillStyle = LIME_ACCENT;
+  ctx.fillText('⚡ RACHA ACTIVA', 152, 298);
 
-  ctx.font = '800 108px ui-monospace, SFMono-Regular, Menlo, monospace';
+  // Optional PR Pill next to streak pill
+  if (snapshot.prsCount > 0) {
+    const prPillX = 360;
+    const prText = `★ ${snapshot.prsCount} ${snapshot.prsCount === 1 ? 'PR SEMANAL' : 'PRs SEMANALES'}`;
+    ctx.font = '800 18px system-ui, -apple-system, sans-serif';
+    const prW = ctx.measureText(prText).width + 36;
+    drawRoundedRect(ctx, prPillX, 274, prW, 36, 10);
+    ctx.fillStyle = 'rgba(251, 191, 36, 0.2)';
+    ctx.fill();
+    ctx.lineWidth = 1.5;
+    ctx.strokeStyle = GOLD_PR;
+    ctx.stroke();
+    ctx.fillStyle = '#FEF08A';
+    ctx.fillText(prText, prPillX + 18, 298);
+  }
+
+  ctx.font = '900 112px ui-monospace, SFMono-Regular, Menlo, monospace';
   ctx.fillStyle = '#FFFFFF';
   const streakStr = String(snapshot.streakDays);
-  ctx.fillText(streakStr, 136, 418);
+  ctx.fillText(streakStr, 134, 418);
   const streakW = ctx.measureText(streakStr).width;
 
-  ctx.font = '700 34px system-ui, -apple-system, sans-serif';
-  ctx.fillStyle = '#D4FF33';
-  ctx.fillText(snapshot.streakDays === 1 ? 'día activo' : 'días activos', 158 + streakW, 416);
+  ctx.font = '800 32px system-ui, -apple-system, sans-serif';
+  ctx.fillStyle = LIME_ACCENT;
+  ctx.fillText(
+    snapshot.streakDays === 1 ? 'día activo' : 'días activos',
+    154 + streakW,
+    416,
+  );
+
+  if (snapshot.topPrLabel) {
+    ctx.font = '600 19px system-ui, -apple-system, sans-serif';
+    ctx.fillStyle = '#FEF08A';
+    ctx.fillText(`Mejor marca: ${snapshot.topPrLabel}`, 134, 456);
+  }
 
   ctx.textAlign = 'right';
-  ctx.font = '700 22px system-ui, -apple-system, sans-serif';
-  ctx.fillStyle = '#9CA3AF';
-  ctx.fillText('SESIONES EN LA SEMANA', width - 136, 316);
-  ctx.font = '800 64px ui-monospace, SFMono-Regular, Menlo, monospace';
-  ctx.fillStyle = '#34D399';
-  ctx.fillText(String(snapshot.sessionsCount), width - 136, 394);
-  ctx.font = '600 20px system-ui, -apple-system, sans-serif';
-  ctx.fillStyle = '#D1D5DB';
+  ctx.font = '700 20px system-ui, -apple-system, sans-serif';
+  ctx.fillStyle = '#A1A1AA';
+  ctx.fillText('SESIONES COMPLETADAS', width - 134, 304);
+  ctx.font = '900 72px ui-monospace, SFMono-Regular, Menlo, monospace';
+  ctx.fillStyle = LIME_ACCENT;
+  ctx.fillText(String(snapshot.sessionsCount), width - 134, 392);
+  ctx.font = '600 19px system-ui, -apple-system, sans-serif';
+  ctx.fillStyle = '#D4D4D8';
   ctx.fillText(
     `${snapshot.strengthCount} fuerza · ${snapshot.cardioCount} cardio · ${snapshot.hiitCount} HIIT`,
-    width - 136,
+    width - 134,
     438,
   );
   ctx.textAlign = 'left';
 
   // Grid of 4 Primary KPI Cards (2x2)
   const colW = (width - 192 - 24) / 2;
-  const rowH = 220;
+  const rowH = 216;
   const gridTop = 516;
 
-  // Weight delta formatting
   let weightDisplayStr = 'Sin cambios';
-  let weightColor = '#E5E7EB';
+  let weightColor = '#E4E4E7';
   if (snapshot.netWeightDeltaKg !== null) {
     const absConverted = kgToDisplayWeight(
       Math.abs(snapshot.netWeightDeltaKg),
@@ -359,7 +434,7 @@ export async function renderWeeklyShareCardDataUrl(
     } else {
       const sign = snapshot.netWeightDeltaKg > 0 ? '+' : '-';
       weightDisplayStr = `${sign}${absConverted.toFixed(1)} ${weightUnit}`;
-      weightColor = snapshot.netWeightDeltaKg < 0 ? '#D4FF33' : '#FBBF24';
+      weightColor = snapshot.netWeightDeltaKg < 0 ? LIME_ACCENT : GOLD_PR;
     }
   } else if (snapshot.latestWeightKg !== null) {
     weightDisplayStr = `${kgToDisplayWeight(snapshot.latestWeightKg, weightUnit).toFixed(1)} ${weightUnit}`;
@@ -388,13 +463,13 @@ export async function renderWeeklyShareCardDataUrl(
       title: 'DISTANCIA ACUMULADA',
       value: formatDistance(snapshot.totalDistanceKm, distanceUnit, 2),
       sub: 'Cardio GPS + Caminatas + Pasos',
-      color: '#38BDF8',
+      color: LIME_ACCENT,
     },
     {
       title: 'PROMEDIO DE SUEÑO',
       value: sleepValueStr,
       sub: sleepSubStr,
-      color: '#A78BFA',
+      color: '#38BDF8',
     },
     {
       title: 'RECUPERACIÓN Y PULSO',
@@ -414,70 +489,108 @@ export async function renderWeeklyShareCardDataUrl(
     const y = gridTop + row * (rowH + 24);
 
     drawRoundedRect(ctx, x, y, colW, rowH, 28);
-    ctx.fillStyle = '#0C0E13';
+    ctx.fillStyle = '#090B0F';
     ctx.fill();
     ctx.lineWidth = 2;
-    ctx.strokeStyle = '#232836';
+    ctx.strokeStyle = '#27272A';
     ctx.stroke();
 
-    ctx.font = '700 20px system-ui, -apple-system, sans-serif';
-    ctx.fillStyle = '#9CA3AF';
-    ctx.fillText(kpi.title, x + 32, y + 52);
-
-    ctx.font = '800 54px ui-monospace, SFMono-Regular, Menlo, monospace';
+    drawRoundedRect(ctx, x + 32, y + 18, 48, 5, 3);
     ctx.fillStyle = kpi.color;
-    ctx.fillText(kpi.value, x + 32, y + 132);
+    ctx.fill();
 
-    ctx.font = '600 20px system-ui, -apple-system, sans-serif';
+    ctx.font = '700 19px system-ui, -apple-system, sans-serif';
     ctx.fillStyle = '#A1A1AA';
-    ctx.fillText(kpi.sub, x + 32, y + 182);
+    ctx.fillText(kpi.title, x + 32, y + 58);
+
+    ctx.font = '900 54px ui-monospace, SFMono-Regular, Menlo, monospace';
+    ctx.fillStyle = kpi.color;
+    ctx.fillText(kpi.value, x + 32, y + 134);
+
+    ctx.font = '600 19px system-ui, -apple-system, sans-serif';
+    ctx.fillStyle = '#A1A1AA';
+    ctx.fillText(kpi.sub, x + 32, y + 180);
   });
 
-  // Bottom Weekly Highlights Strip
-  const stripY = 1004;
-  drawRoundedRect(ctx, 96, stripY, width - 192, 176, 28);
-  ctx.fillStyle = '#0C0E13';
+  // Bottom Weekly Highlights Strip (including PRs)
+  const stripY = 998;
+  drawRoundedRect(ctx, 96, stripY, width - 192, 178, 28);
+  ctx.fillStyle = '#090B0F';
   ctx.fill();
-  ctx.strokeStyle = '#232836';
+  ctx.lineWidth = 2;
+  ctx.strokeStyle = '#27272A';
   ctx.stroke();
 
-  ctx.font = '700 21px system-ui, -apple-system, sans-serif';
-  ctx.fillStyle = '#D4FF33';
-  ctx.fillText('RESUMEN BIOMÉTRICO SEMANAL', 132, stripY + 48);
+  ctx.font = '800 20px system-ui, -apple-system, sans-serif';
+  ctx.fillStyle = LIME_ACCENT;
+  ctx.fillText('BALANCE BIOMÉTRICO & RÉCORDS', 132, stripY + 46);
 
   const summaryCols = [
-    { label: 'SUEÑO', val: snapshot.avgSleepQualityPct !== null ? `${snapshot.avgSleepQualityPct}%` : '--' },
-    { label: 'RECUPERACIÓN', val: `${snapshot.avgRecoveryScore}/100` },
-    { label: 'PULSO MEDIO', val: snapshot.avgPulseBpm !== null ? `${snapshot.avgPulseBpm} BPM` : '--' },
+    {
+      label: 'RÉCORDS (PR)',
+      val: snapshot.prsCount > 0 ? `★ ${snapshot.prsCount}` : '0',
+      color: snapshot.prsCount > 0 ? GOLD_PR : '#FFFFFF',
+    },
+    {
+      label: 'CALIDAD SUEÑO',
+      val: snapshot.avgSleepQualityPct !== null ? `${snapshot.avgSleepQualityPct}%` : '--',
+      color: '#FFFFFF',
+    },
+    {
+      label: 'RECUPERACIÓN',
+      val: `${snapshot.avgRecoveryScore}/100`,
+      color: LIME_ACCENT,
+    },
+    {
+      label: 'PULSO MEDIO',
+      val: snapshot.avgPulseBpm !== null ? `${snapshot.avgPulseBpm} BPM` : '--',
+      color: '#34D399',
+    },
   ];
-  const sColW = (width - 192 - 64) / 3;
+  const sColW = (width - 192 - 64) / 4;
   summaryCols.forEach((c, i) => {
-    const cx = 128 + i * sColW;
-    ctx.font = '700 18px system-ui, -apple-system, sans-serif';
+    const cx = 132 + i * sColW;
+    ctx.font = '700 16px system-ui, -apple-system, sans-serif';
     ctx.fillStyle = '#71717A';
-    ctx.fillText(c.label, cx, stripY + 98);
+    ctx.fillText(c.label, cx, stripY + 96);
 
-    ctx.font = '800 34px ui-monospace, SFMono-Regular, Menlo, monospace';
-    ctx.fillStyle = '#FFFFFF';
-    ctx.fillText(c.val, cx, stripY + 144);
+    ctx.font = '800 32px ui-monospace, SFMono-Regular, Menlo, monospace';
+    ctx.fillStyle = c.color;
+    ctx.fillText(c.val, cx, stripY + 142);
   });
 
-  // Footer
-  ctx.font = '600 22px system-ui, -apple-system, sans-serif';
+  // Footer with PULSOFIT signature
+  ctx.strokeStyle = '#27272A';
+  ctx.lineWidth = 2;
+  ctx.beginPath();
+  ctx.moveTo(96, height - 134);
+  ctx.lineTo(width - 96, height - 134);
+  ctx.stroke();
+
+  ctx.font = '800 22px system-ui, -apple-system, sans-serif';
+  ctx.fillStyle = '#FFFFFF';
+  ctx.fillText('PULSO', 96, height - 88);
+  const pw = ctx.measureText('PULSO').width;
+  ctx.fillStyle = LIME_ACCENT;
+  ctx.fillText('FIT', 96 + pw, height - 88);
+  const fw = ctx.measureText('FIT').width;
+
+  ctx.font = '600 20px system-ui, -apple-system, sans-serif';
   ctx.fillStyle = '#71717A';
   ctx.fillText(
-    `PulsoFit · Ventana local ${snapshot.startDateIso} a ${snapshot.endDateIso}`,
-    96,
-    height - 96,
+    `  ·  Ventana local ${snapshot.startDateIso} → ${snapshot.endDateIso}`,
+    96 + pw + fw,
+    height - 88,
   );
   ctx.textAlign = 'right';
-  ctx.fillStyle = '#34D399';
-  ctx.fillText('pulsofit.app', width - 96, height - 96);
+  ctx.font = '800 22px ui-monospace, SFMono-Regular, Menlo, monospace';
+  ctx.fillStyle = LIME_ACCENT;
+  ctx.fillText('RENDIMIENTO & BIOMETRÍA', width - 96, height - 88);
   ctx.textAlign = 'left';
 
   const dataUrl = canvas.toDataURL('image/png');
   const fileName = `pulsofit-resumen-semanal-${snapshot.endDateIso}.png`;
-  const summaryText = `Mi semana en PulsoFit (${snapshot.dateRangeLabel}): Racha ${snapshot.streakDays}d · ${snapshot.sessionsCount} sesiones · ${formatDistance(snapshot.totalDistanceKm, distanceUnit, 2)} · Cambio peso: ${weightDisplayStr}`;
+  const summaryText = `Mi semana en PulsoFit (${snapshot.dateRangeLabel}): Racha ${snapshot.streakDays}d · ${snapshot.sessionsCount} sesiones · ${snapshot.prsCount} PRs · ${formatDistance(snapshot.totalDistanceKm, distanceUnit, 2)} · Cambio peso: ${weightDisplayStr}`;
 
   return { dataUrl, fileName, summaryText };
 }

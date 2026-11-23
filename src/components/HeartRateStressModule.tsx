@@ -554,9 +554,21 @@ export const HeartRateStressModule: React.FC<HeartRateStressModuleProps> = ({
   };
 
   useEffect(() => {
+    if (!isScanning) {
+      void hardwareRef.current.releaseWakeLock('ppg-scanner');
+      return undefined;
+    }
+    void hardwareRef.current.acquireWakeLock('ppg-scanner');
+    return () => {
+      void hardwareRef.current.releaseWakeLock('ppg-scanner');
+    };
+  }, [isScanning]);
+
+  useEffect(() => {
     isMountedRef.current = true;
     return () => {
       isMountedRef.current = false;
+      void hardwareRef.current.releaseWakeLock('ppg-scanner');
       void stopCameraResources();
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -565,6 +577,7 @@ export const HeartRateStressModule: React.FC<HeartRateStressModuleProps> = ({
   const turnOffTorchAndStopCamera = async () => {
     stopScanLoop();
     await stopCameraResources();
+    await hardwareRef.current.releaseWakeLock('ppg-scanner');
     scanPhaseRef.current = 'idle';
     validCalibrationMsRef.current = 0;
     validMeasureMsRef.current = 0;
@@ -678,6 +691,7 @@ export const HeartRateStressModule: React.FC<HeartRateStressModuleProps> = ({
 
     try {
       stopPreviewLoop();
+      void hardwareRef.current.acquireWakeLock('ppg-scanner');
 
       // 1. Open rear camera stream FIRST with 640x480@30fps constraints
       let stream = streamRef.current;
@@ -844,6 +858,7 @@ export const HeartRateStressModule: React.FC<HeartRateStressModuleProps> = ({
       rafRef.current = requestAnimationFrame(processFrame);
     } catch {
       await stopCameraResources();
+      await hardwareRef.current.releaseWakeLock('ppg-scanner');
       scanPhaseRef.current = 'idle';
       setScanPhase('idle');
       setIsScanning(false);

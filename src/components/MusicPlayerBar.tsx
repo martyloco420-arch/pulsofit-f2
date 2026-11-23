@@ -438,14 +438,27 @@ export const MusicPlayerBar: React.FC<MusicPlayerBarProps> = ({
     }
     const audioEl = audioRef.current;
     const rawDuration = typeof durSec === 'number' ? durSec : audioEl?.duration ?? 0;
-    if (!Number.isFinite(rawDuration) || rawDuration <= 0) return;
     const rawPosition = typeof posSec === 'number' ? posSec : audioEl?.currentTime ?? 0;
-    const clampedPos = Math.max(0, Math.min(rawDuration, Number.isFinite(rawPosition) ? rawPosition : 0));
+    if (
+      !Number.isFinite(rawDuration) ||
+      rawDuration <= 0 ||
+      !Number.isFinite(rawPosition) ||
+      rawPosition < 0 ||
+      rawPosition > rawDuration
+    ) {
+      return;
+    }
+    const playbackRate =
+      audioEl?.playbackRate &&
+      Number.isFinite(audioEl.playbackRate) &&
+      audioEl.playbackRate > 0
+        ? audioEl.playbackRate
+        : 1;
     try {
       navigator.mediaSession.setPositionState({
         duration: rawDuration,
-        playbackRate: 1,
-        position: clampedPos,
+        playbackRate,
+        position: rawPosition,
       });
     } catch {
       // Ignore invalid position state on unsupported platforms
@@ -477,43 +490,93 @@ export const MusicPlayerBar: React.FC<MusicPlayerBarProps> = ({
     if (typeof navigator === 'undefined' || !('mediaSession' in navigator)) return;
 
     if (currentTrack) {
+      if (typeof MediaMetadata !== 'undefined') {
+        try {
+          navigator.mediaSession.metadata = new MediaMetadata({
+            title: currentTrack.title,
+            artist: currentTrack.artist,
+            album: 'PulsoFit',
+            artwork: [
+              {
+                src: '/pwa-512x512.png',
+                sizes: '512x512',
+                type: 'image/png',
+              },
+            ],
+          });
+        } catch {
+          // Ignore MediaMetadata errors on older browsers
+        }
+      }
+    } else {
       try {
-        navigator.mediaSession.metadata = new MediaMetadata({
-          title: currentTrack.title,
-          artist: currentTrack.artist,
-          album: 'PulsoFit Offline Player',
-        });
+        navigator.mediaSession.metadata = null;
       } catch {
-        // Ignore MediaMetadata errors on older browsers
+        // Ignore clear metadata errors
       }
     }
 
-    navigator.mediaSession.playbackState = isPlaying ? 'playing' : 'paused';
+    try {
+      navigator.mediaSession.playbackState = isPlaying ? 'playing' : 'paused';
+    } catch {
+      // Ignore playbackState errors on unsupported platforms
+    }
 
-    const tryHandler = (action: MediaSessionAction, handler: MediaSessionActionHandler | null) => {
-      try {
-        navigator.mediaSession.setActionHandler(action, handler);
-      } catch {
-        // Unsupported action on platform
-      }
-    };
+    try {
+      navigator.mediaSession.setActionHandler('play', () => {
+        void handleMediaPlay();
+      });
+    } catch {
+      // Unsupported 'play' action handler on platform
+    }
 
-    tryHandler('play', () => {
-      void handleMediaPlay();
-    });
-    tryHandler('pause', () => {
-      audioRef.current?.pause();
-      setIsPlaying(false);
-    });
-    tryHandler('previoustrack', () => handleStepTrack(-1));
-    tryHandler('nexttrack', () => handleStepTrack(1));
-    tryHandler('seekto', (details) => {
-      if (audioRef.current && typeof details.seekTime === 'number') {
-        audioRef.current.currentTime = details.seekTime;
-        setCurrentTime(details.seekTime);
-        updateMediaPositionState(details.seekTime, audioRef.current.duration);
-      }
-    });
+    try {
+      navigator.mediaSession.setActionHandler('pause', () => {
+        audioRef.current?.pause();
+        setIsPlaying(false);
+      });
+    } catch {
+      // Unsupported 'pause' action handler on platform
+    }
+
+    try {
+      navigator.mediaSession.setActionHandler('previoustrack', () => {
+        handleStepTrack(-1);
+      });
+    } catch {
+      // Unsupported 'previoustrack' action handler on platform
+    }
+
+    try {
+      navigator.mediaSession.setActionHandler('nexttrack', () => {
+        handleStepTrack(1);
+      });
+    } catch {
+      // Unsupported 'nexttrack' action handler on platform
+    }
+
+    try {
+      navigator.mediaSession.setActionHandler('seekto', (details) => {
+        const audioEl = audioRef.current;
+        if (
+          !audioEl ||
+          typeof details.seekTime !== 'number' ||
+          !Number.isFinite(details.seekTime)
+        ) {
+          return;
+        }
+        const boundedMax =
+          Number.isFinite(audioEl.duration) && audioEl.duration > 0
+            ? audioEl.duration
+            : details.seekTime;
+        const nextPos = Math.max(0, Math.min(boundedMax, details.seekTime));
+        audioEl.currentTime = nextPos;
+        setCurrentTime(nextPos);
+        updateMediaPositionState(nextPos, audioEl.duration);
+      });
+    } catch {
+      // Unsupported 'seekto' action handler on platform
+    }
   }, [currentTrack, isPlaying, handleMediaPlay, handleStepTrack, updateMediaPositionState]);
 
   const handleImportFiles = async (e: React.ChangeEvent<HTMLInputElement>) => {
@@ -652,6 +715,7 @@ export const MusicPlayerBar: React.FC<MusicPlayerBarProps> = ({
                   const nextTime = Number(e.target.value);
                   if (audioRef.current) {
                     audioRef.current.currentTime = nextTime;
+                    updateMediaPositionState(nextTime, audioRef.current.duration);
                   }
                   setCurrentTime(nextTime);
                 }}
@@ -1023,7 +1087,15 @@ export const MusicPlayerBar: React.FC<MusicPlayerBarProps> = ({
             setIsPlaying(false);
           }
         }}
-        onPlay={() => setIsPlaying(true)}
+        onPlay={() => {
+          setIsPlaying(true);
+          if (audioRef.current) {
+            updateMediaPositionState(
+              audioRef.current.currentTime,
+              audioRef.current.duration,
+            );
+          }
+        }}
         onPause={() => setIsPlaying(false)}
         onError={() => {
           setIsPlaying(false);

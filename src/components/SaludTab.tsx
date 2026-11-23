@@ -45,8 +45,10 @@ import type {
   WeightUnit,
 } from '../types/fitness';
 import { HeartRateStressModule } from './HeartRateStressModule';
+import { HrvRhrTrend30dCard } from './HrvRhrTrend30dCard';
 
 interface SaludTabProps {
+  profileId?: string;
   profile: UserProfile;
   bodyScans: BodyCompositionScan[];
   bodyWeights: BodyWeightEntry[];
@@ -118,6 +120,7 @@ function playScaleLockBeep(): void {
 }
 
 export const SaludTab: React.FC<SaludTabProps> = ({
+  profileId,
   profile,
   bodyScans,
   bodyWeights,
@@ -798,6 +801,9 @@ export const SaludTab: React.FC<SaludTabProps> = ({
         onSaveBloodPressureRecord={handleGuardedSaveBloodPressureRecord}
         onDeleteBloodPressureRecord={onDeleteBloodPressureRecord}
       />
+
+      {/* 30-Day HRV & Resting Heart Rate Trend */}
+      <HrvRhrTrend30dCard pulseRecords={pulseRecords} profileId={profileId} />
 
       {/* Body Composition Panel (OKOK / Chipsea Smart Scale Breakdown) */}
       <section className="rounded-3xl border border-[#222631] bg-[#12141A] p-4 sm:p-5 space-y-4">

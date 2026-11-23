@@ -1,6 +1,10 @@
 import React, { useEffect, useRef, useState } from 'react';
 import { Barcode, Camera, Check, Loader2, Search, X } from 'lucide-react';
 import { lookupFoodBarcode, type BarcodeProductLookup } from '../lib/aiClient';
+import {
+  getCachedBarcodeProduct,
+  saveCachedBarcodeProduct,
+} from '../lib/barcodeCache';
 import { useHardwareManager } from '../hooks/useHardwareManager';
 import type { FavoriteMeal, FoodEntry, MealType } from '../types/fitness';
 
@@ -33,6 +37,7 @@ export const BarcodeScannerModal: React.FC<BarcodeScannerModalProps> = ({
   const [isLookingUp, setIsLookingUp] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [product, setProduct] = useState<BarcodeProductLookup | null>(null);
+  const [fromOfflineCache, setFromOfflineCache] = useState(false);
   const [gramsText, setGramsText] = useState('100');
   const [saveAsFavorite, setSaveAsFavorite] = useState(false);
 
@@ -65,17 +70,42 @@ export const BarcodeScannerModal: React.FC<BarcodeScannerModalProps> = ({
       stopCamera();
       setError(null);
       setProduct(null);
+      setFromOfflineCache(false);
     }
     return () => stopCamera();
   }, [isOpen]);
 
   const handleLookupCode = async (code: string) => {
+    const cleanCode = code.replace(/[^0-9A-Za-z]/g, '').trim();
     setError(null);
-    setIsLookingUp(true);
     setProduct(null);
+    setFromOfflineCache(false);
+
+    if (cleanCode.length < 4) {
+      setError('Ingresa un código de barras válido (mínimo 4 caracteres).');
+      return;
+    }
+
+    setIsLookingUp(true);
     try {
-      const found = await lookupFoodBarcode(code);
+      const cached = await getCachedBarcodeProduct(cleanCode);
+      if (cached) {
+        setProduct(cached);
+        setFromOfflineCache(true);
+        setGramsText(String(cached.defaultGrams || 100));
+        return;
+      }
+
+      if (typeof navigator !== 'undefined' && navigator.onLine === false) {
+        throw new Error(
+          'Sin conexión a internet y este código aún no está en tu caché offline.',
+        );
+      }
+
+      const found = await lookupFoodBarcode(cleanCode);
+      await saveCachedBarcodeProduct(found);
       setProduct(found);
+      setFromOfflineCache(false);
       setGramsText(String(found.defaultGrams || 100));
     } catch (err) {
       setError(
@@ -285,7 +315,16 @@ export const BarcodeScannerModal: React.FC<BarcodeScannerModalProps> = ({
           {product && scaled && (
             <div className="rounded-2xl border border-[#D4FF33]/40 bg-[#0E1014] p-4 space-y-4">
               <div>
-                <p className="text-xs font-bold text-[#D4FF33]">OpenFoodFacts · {product.barcode}</p>
+                <div className="flex items-center justify-between gap-2">
+                  <p className="text-xs font-bold text-[#D4FF33]">
+                    OpenFoodFacts · {product.barcode}
+                  </p>
+                  {fromOfflineCache && (
+                    <span className="inline-flex items-center rounded-md border border-emerald-500/35 bg-emerald-500/15 px-2 py-0.5 text-[10px] font-bold text-emerald-300">
+                      Caché offline
+                    </span>
+                  )}
+                </div>
                 <h4 className="text-lg font-extrabold text-white mt-0.5">{product.name}</h4>
                 <p className="text-xs text-zinc-400 mt-0.5">
                   Por 100g: {product.per100g.calories} kcal · P {product.per100g.proteinG}g · C{' '}

@@ -312,6 +312,15 @@ export async function generateWeeklyMealPlanAi(payload: {
 export interface PersonalCoachContext {
   profileName: string;
   goal: string;
+  customGoal?: string | null;
+  age?: number;
+  heightCm?: number;
+  targetWeightDisplay?: string | null;
+  equipment?: string[];
+  trainingDaysPerWeek?: number;
+  scheduledRestDates?: string[];
+  pausaActivaCountToday?: number;
+  shiftModeActive?: boolean;
   weightUnit: 'kg' | 'lb';
   liquidUnit: 'ml' | 'oz';
   personality: CoachPersonality;
@@ -319,9 +328,15 @@ export interface PersonalCoachContext {
   workoutsLast7Days: number;
   trainedToday: boolean;
   lastWorkoutSummary?: string | null;
+  avgWorkoutRpe7d?: number | null;
+  recentWorkoutsSummary?: string[];
+  recentPrLabels?: string[];
+  recentCardioCount7d?: number;
+  recentHiitCount7d?: number;
   latestWeightDisplay: string | null;
   weightDelta7dDisplay: string | null;
   weightDelta30dDisplay: string | null;
+  waistCm?: number | null;
   bodyFatPct?: number | null;
   muscleMassPct?: number | null;
   todaySteps: number;
@@ -343,13 +358,20 @@ export interface PersonalCoachContext {
   sleepHours: number | null;
   pulseBpm: number | null;
   hrvMs: number | null;
+  avgBpm7d?: number | null;
+  avgBpm30d?: number | null;
+  avgHrv7d?: number | null;
+  avgHrv30d?: number | null;
   stressLabel: string;
   lastBpDisplay?: string | null;
+  avgBp7dDisplay?: string | null;
+  avgBp30dDisplay?: string | null;
   recoveryIndexScore: number;
   recoveryStatusLabel: string;
   streakDays: number;
   shieldUsedInCurrent7d: number;
   isTodayRestShield: boolean;
+  syncedModules?: string[];
 }
 
 export interface PersonalCoachReply {
@@ -367,6 +389,10 @@ function buildMultiTabCoachBullets(context: PersonalCoachContext): {
 } {
   const good: string[] = [];
   const weak: string[] = [];
+
+  if (context.recentPrLabels && context.recentPrLabels.length > 0) {
+    good.push(`PR reciente: ${context.recentPrLabels[0]}.`);
+  }
 
   if (context.trainedToday) {
     good.push(
@@ -394,9 +420,10 @@ function buildMultiTabCoachBullets(context: PersonalCoachContext): {
     );
   }
 
-  if (context.recoveryIndexScore >= 75) {
-    good.push(`Recuperación alta (${context.recoveryIndexScore}/100 · ${context.stressLabel}).`);
-  } else if (context.recoveryIndexScore < 55) {
+  if (context.recoveryIndexScore >= 70) {
+    const hrvNote = context.hrvMs !== null ? ` · HRV ${context.hrvMs} ms` : '';
+    good.push(`Recuperación óptima (${context.recoveryIndexScore}/100${hrvNote}).`);
+  } else if (context.recoveryIndexScore < 45) {
     weak.push(`Recuperación baja (${context.recoveryIndexScore}/100): modera la carga.`);
   }
 

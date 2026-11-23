@@ -1,12 +1,14 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react';
 import {
   Bot,
+  Check,
   Flame,
   HeartHandshake,
   Loader2,
   RefreshCw,
   Send,
   Sparkles,
+  Target,
   Volume2,
   VolumeX,
 } from 'lucide-react';
@@ -16,6 +18,8 @@ import {
   askPersonalCoachAi,
   generateOfflinePersonalCoachReply,
 } from '../lib/aiClient';
+import { triggerHaptic } from '../lib/haptics';
+import { getSavedCustomGoal, saveCustomGoalToLocal } from '../lib/storage';
 import {
   cancelCoachSpeech,
   speakCoachCue,
@@ -32,7 +36,16 @@ interface PersonalCoachCardProps {
     personality: CoachPersonality,
     nextHistory: CoachChatMessage[],
   ) => void;
+  onSaveCustomGoal?: (nextCustomGoal: string) => void;
 }
+
+const GOAL_QUICK_CHIPS = [
+  'Pérdida de grasa',
+  'Recomposición',
+  'Fuerza',
+  'Resistencia',
+  'Salud y Energía',
+];
 
 const QUICK_PROMPTS = [
   'Tuve cambio de turno hoy',
@@ -47,6 +60,7 @@ export const PersonalCoachCard: React.FC<PersonalCoachCardProps> = ({
   preferredVoiceUri,
   context,
   onUpdateCoachState,
+  onSaveCustomGoal,
 }) => {
   const hardware = useHardwareManager();
   const [inputText, setInputText] = useState('');
@@ -54,8 +68,20 @@ export const PersonalCoachCard: React.FC<PersonalCoachCardProps> = ({
   const [coachError, setCoachError] = useState<string | null>(null);
   const [isSpeaking, setIsSpeaking] = useState(false);
   const [localPreviewReply, setLocalPreviewReply] = useState<CoachChatMessage | null>(null);
+  const [goalDraft, setGoalDraft] = useState<string>(
+    () => context.customGoal?.trim() || getSavedCustomGoal(profileKey) || '',
+  );
+  const [goalSavedFeedback, setGoalSavedFeedback] = useState(false);
   const speechCheckTimerRef = useRef<number | null>(null);
   const chatScrollRef = useRef<HTMLDivElement | null>(null);
+
+  const effectiveContext = useMemo<PersonalCoachContext>(
+    () => ({
+      ...context,
+      customGoal: goalDraft.trim() || context.customGoal || null,
+    }),
+    [context, goalDraft],
+  );
 
   const lastCoachMessage = useMemo(() => {
     for (let i = chatHistory.length - 1; i >= 0; i -= 1) {
@@ -72,7 +98,7 @@ export const PersonalCoachCard: React.FC<PersonalCoachCardProps> = ({
     if (lastCoachMessage && lastCoachMessage.personality === personality) {
       return lastCoachMessage;
     }
-    const offline = generateOfflinePersonalCoachReply(context, chatHistory);
+    const offline = generateOfflinePersonalCoachReply(effectiveContext, chatHistory);
     return {
       id: `preview_${profileKey}_${personality}`,
       role: 'coach',
@@ -85,7 +111,12 @@ export const PersonalCoachCard: React.FC<PersonalCoachCardProps> = ({
       source: offline.source,
       createdAt: new Date().toISOString(),
     };
-  }, [localPreviewReply, lastCoachMessage, personality, context, chatHistory, profileKey]);
+  }, [localPreviewReply, lastCoachMessage, personality, effectiveContext, chatHistory, profileKey]);
+
+  // Sync goal draft when profile changes or external customGoal updates (e.g. onboarding)
+  useEffect(() => {
+    setGoalDraft(context.customGoal?.trim() || getSavedCustomGoal(profileKey) || '');
+  }, [profileKey, context.customGoal]);
 
   // Reset transient preview when switching profile
   useEffect(() => {
@@ -202,7 +233,7 @@ export const PersonalCoachCard: React.FC<PersonalCoachCardProps> = ({
     try {
       const result = await askPersonalCoachAi({
         context: {
-          ...context,
+          ...effectiveContext,
           personality: targetPersonality,
         },
         personality: targetPersonality,
@@ -241,7 +272,7 @@ export const PersonalCoachCard: React.FC<PersonalCoachCardProps> = ({
     if (nextPersonality === personality) return;
     stopCoachVoice();
     const immediate = generateOfflinePersonalCoachReply(
-      { ...context, personality: nextPersonality },
+      { ...effectiveContext, personality: nextPersonality },
       chatHistory,
     );
     setLocalPreviewReply({
@@ -265,12 +296,22 @@ export const PersonalCoachCard: React.FC<PersonalCoachCardProps> = ({
     void requestCoachBriefing(personality, inputText);
   };
 
+  const commitCustomGoal = (nextValue: string) => {
+    const clean = nextValue.trim().slice(0, 140);
+    setGoalDraft(clean);
+    saveCustomGoalToLocal(profileKey, clean);
+    onSaveCustomGoal?.(clean);
+    triggerHaptic('success');
+    setGoalSavedFeedback(true);
+    window.setTimeout(() => setGoalSavedFeedback(false), 1800);
+  };
+
   const isSargento = personality === 'sargento';
 
   return (
     <section
       aria-label="Coach IA Personal"
-      className={`rounded-3xl border p-4 sm:p-5 space-y-4 transition-colors ${
+      className={`h-full flex flex-col justify-between rounded-3xl border p-4 sm:p-5 space-y-4 transition-colors ${
         isSargento
           ? 'border-amber-400/35 bg-gradient-to-br from-[#171412] via-[#12141A] to-[#101218]'
           : 'border-emerald-400/35 bg-gradient-to-br from-[#101916] via-[#12141A] to-[#101218]'
@@ -342,34 +383,128 @@ export const PersonalCoachCard: React.FC<PersonalCoachCardProps> = ({
         </div>
       </div>
 
-      {/* Live Context Snapshot Pills */}
-      <div className="flex flex-wrap gap-1.5 text-[11px]">
-        <span className="rounded-lg border border-white/10 bg-[#0B0D12] px-2.5 py-1 font-mono tabular-nums text-zinc-300">
-          {context.trainedToday
-            ? 'Entrenó hoy ✓'
-            : context.isTodayRestShield
-              ? 'Descanso Escudo ✓'
-              : context.daysSinceLastWorkout === null
-                ? 'Sin rutinas aún'
-                : `Sin entrenar: ${context.daysSinceLastWorkout}d`}
-        </span>
-        {context.latestWeightDisplay && (
+      {/* Persistent Editable Objective ("Mi Objetivo Actual") */}
+      <div className="rounded-2xl border border-[#242936] bg-[#0B0D12]/90 p-3 space-y-2.5">
+        <div className="flex items-center justify-between gap-2">
+          <div className="flex items-center gap-1.5 text-[11px] font-extrabold uppercase tracking-wider text-[#D4FF33]">
+            <Target className="w-3.5 h-3.5 shrink-0" />
+            <span>Mi Objetivo Actual</span>
+          </div>
+          {goalSavedFeedback && (
+            <span className="inline-flex items-center gap-1 text-[10px] font-bold text-emerald-300">
+              <Check className="w-3 h-3" />
+              Guardado
+            </span>
+          )}
+        </div>
+
+        <div className="flex flex-wrap gap-1.5">
+          {GOAL_QUICK_CHIPS.map((chip) => {
+            const active = goalDraft.trim().toLowerCase() === chip.toLowerCase();
+            return (
+              <button
+                key={chip}
+                type="button"
+                onClick={() => commitCustomGoal(chip)}
+                className={`min-h-[26px] rounded-lg px-2.5 text-[10px] font-bold border transition-colors ${
+                  active
+                    ? 'border-[#D4FF33] bg-[#D4FF33]/15 text-[#D4FF33]'
+                    : 'border-[#252A38] bg-[#12151E] text-zinc-300 hover:text-white'
+                }`}
+              >
+                {chip}
+              </button>
+            );
+          })}
+        </div>
+
+        <form
+          onSubmit={(e) => {
+            e.preventDefault();
+            commitCustomGoal(goalDraft);
+          }}
+          className="flex items-center gap-1.5"
+        >
+          <input
+            type="text"
+            value={goalDraft}
+            onChange={(e) => setGoalDraft(e.target.value)}
+            onBlur={() => {
+              const saved = context.customGoal?.trim() || getSavedCustomGoal(profileKey);
+              if (goalDraft.trim() !== saved) {
+                commitCustomGoal(goalDraft);
+              }
+            }}
+            placeholder="Ej. Bajar 4 kg sin perder fuerza en press..."
+            maxLength={140}
+            aria-label="Mi Objetivo Actual"
+            className="flex-1 min-w-0 min-h-[36px] rounded-xl border border-[#262B38] bg-[#0F1219] px-3 text-xs text-white placeholder:text-zinc-500 focus:border-[#D4FF33] focus:outline-none"
+          />
+          <button
+            type="submit"
+            className="min-h-[36px] rounded-xl border border-[#2A2F3D] bg-[#161A24] hover:border-[#D4FF33]/50 px-3 text-[11px] font-bold text-[#D4FF33] shrink-0"
+          >
+            Guardar
+          </button>
+        </form>
+      </div>
+
+      {/* Synchronized Omniscient Modules + Live Snapshot Pills */}
+      <div className="space-y-1.5">
+        <div className="flex flex-wrap items-center gap-1 text-[10px]">
+          <span className="text-zinc-500 font-semibold mr-0.5">Sincronizado:</span>
+          {(effectiveContext.syncedModules ?? [
+            'Perfil y Equipo',
+            'Biometría 7d/30d',
+            'Entrenos y PRs',
+            'Nutrición y Agua',
+            'Sueño y Racha',
+          ]).map((mod) => (
+            <span
+              key={mod}
+              className="rounded-md border border-emerald-500/20 bg-emerald-500/5 px-1.5 py-0.5 font-semibold text-emerald-300/90"
+            >
+              {mod}
+            </span>
+          ))}
+        </div>
+
+        <div className="flex flex-wrap gap-1.5 text-[11px]">
           <span className="rounded-lg border border-white/10 bg-[#0B0D12] px-2.5 py-1 font-mono tabular-nums text-zinc-300">
-            Peso: {context.latestWeightDisplay}
-            {context.weightDelta7dDisplay ? ` (${context.weightDelta7dDisplay} 7d)` : ''}
+            {effectiveContext.trainedToday
+              ? 'Entrenó hoy ✓'
+              : effectiveContext.isTodayRestShield
+                ? 'Descanso Escudo ✓'
+                : effectiveContext.daysSinceLastWorkout === null
+                  ? 'Sin rutinas aún'
+                  : `Sin entrenar: ${effectiveContext.daysSinceLastWorkout}d`}
           </span>
-        )}
-        <span className="rounded-lg border border-white/10 bg-[#0B0D12] px-2.5 py-1 font-mono tabular-nums text-sky-300">
-          Agua: {context.waterPct}%
-        </span>
-        <span className="rounded-lg border border-white/10 bg-[#0B0D12] px-2.5 py-1 font-mono tabular-nums text-indigo-300">
-          Recup: {context.recoveryIndexScore}/100
-        </span>
-        {context.pulseBpm !== null && (
-          <span className="rounded-lg border border-white/10 bg-[#0B0D12] px-2.5 py-1 font-mono tabular-nums text-rose-300">
-            {context.pulseBpm} BPM · {context.stressLabel}
+          {effectiveContext.latestWeightDisplay && (
+            <span className="rounded-lg border border-white/10 bg-[#0B0D12] px-2.5 py-1 font-mono tabular-nums text-zinc-300">
+              Peso: {effectiveContext.latestWeightDisplay}
+              {effectiveContext.weightDelta7dDisplay
+                ? ` (${effectiveContext.weightDelta7dDisplay} 7d)`
+                : ''}
+            </span>
+          )}
+          <span className="rounded-lg border border-white/10 bg-[#0B0D12] px-2.5 py-1 font-mono tabular-nums text-sky-300">
+            Agua: {effectiveContext.waterPct}%
           </span>
-        )}
+          <span className="rounded-lg border border-white/10 bg-[#0B0D12] px-2.5 py-1 font-mono tabular-nums text-indigo-300">
+            Recup: {effectiveContext.recoveryIndexScore}/100
+          </span>
+          {effectiveContext.pulseBpm !== null && (
+            <span className="rounded-lg border border-white/10 bg-[#0B0D12] px-2.5 py-1 font-mono tabular-nums text-rose-300">
+              {effectiveContext.pulseBpm} BPM
+              {effectiveContext.hrvMs !== null ? ` · ${effectiveContext.hrvMs} ms` : ''}
+            </span>
+          )}
+          {effectiveContext.recentPrLabels && effectiveContext.recentPrLabels.length > 0 && (
+            <span className="rounded-lg border border-amber-400/25 bg-amber-500/10 px-2.5 py-1 font-semibold text-amber-300 truncate max-w-[200px]">
+              PR: {effectiveContext.recentPrLabels[0]}
+            </span>
+          )}
+        </div>
       </div>
 
       {/* Active Coach Message Card */}

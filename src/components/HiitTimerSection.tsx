@@ -13,6 +13,7 @@ import {
   VolumeX,
 } from 'lucide-react';
 import { InlineDeleteConfirmButton } from './InlineDeleteConfirmButton';
+import { useHardwareManager } from '../hooks/useHardwareManager';
 import {
   computeHeartRateZone,
   connectBluetoothHeartRateMonitor,
@@ -101,6 +102,19 @@ export const HiitTimerSection: React.FC<HiitTimerSectionProps> = ({
   const roundRef = useRef(1);
   const cycleRef = useRef(1);
   const pausedRef = useRef(false);
+  const voiceEnabledRef = useRef(voiceEnabled);
+  voiceEnabledRef.current = voiceEnabled;
+
+  // Absolute-timestamp refs immune to Android Chrome background throttling/suspension
+  const targetEndTimeRef = useRef<number | null>(null);
+  const pausedRemainingMsRef = useRef<number>(0);
+  const elapsedAccumMsRef = useRef<number>(0);
+  const activeSegmentStartMsRef = useRef<number | null>(null);
+  const lastWarningSecRef = useRef<number | null>(null);
+
+  const hardware = useHardwareManager();
+  const hardwareRef = useRef(hardware);
+  hardwareRef.current = hardware;
 
   const totalPlannedSec = useMemo(
     () => (workSec + restSec) * rounds * cycles,
@@ -115,6 +129,18 @@ export const HiitTimerSection: React.FC<HiitTimerSectionProps> = ({
   useEffect(() => {
     pausedRef.current = isPaused;
   }, [isPaused]);
+
+  const isHiitActive = stage !== 'idle' && stage !== 'done' && !isPaused;
+  useEffect(() => {
+    if (isHiitActive) {
+      void hardwareRef.current.acquireWakeLock('hiit-timer');
+    } else {
+      void hardwareRef.current.releaseWakeLock('hiit-timer');
+    }
+    return () => {
+      void hardwareRef.current.releaseWakeLock('hiit-timer');
+    };
+  }, [isHiitActive]);
 
   useEffect(() => {
     return () => {
@@ -153,90 +179,150 @@ export const HiitTimerSection: React.FC<HiitTimerSectionProps> = ({
   };
 
   useEffect(() => {
-    if (stage === 'idle' || stage === 'done') return;
+    if (stage === 'idle' || stage === 'done' || isPaused) return undefined;
 
-    const timer = window.setInterval(() => {
-      if (pausedRef.current) return;
+    const syncTimer = () => {
+      if (pausedRef.current || targetEndTimeRef.current === null) return;
+      const currentStageNow = stageRef.current;
+      if (currentStageNow === 'idle' || currentStageNow === 'done') return;
 
-      setElapsedTotalSec((e) => e + 1);
-      setRemainingSec((prev) => {
-        if (prev > 1) {
-          if (prev <= 4) playTone(560, 0.12);
-          return prev - 1;
+      const now = Date.now();
+      let targetEndTime: number | null = targetEndTimeRef.current;
+
+      if (now < targetEndTime) {
+        const nextRemaining = Math.max(0, Math.ceil((targetEndTime - now) / 1000));
+        setRemainingSec(nextRemaining);
+        if (
+          nextRemaining <= 3 &&
+          nextRemaining >= 1 &&
+          lastWarningSecRef.current !== nextRemaining
+        ) {
+          lastWarningSecRef.current = nextRemaining;
+          playTone(560, 0.12);
         }
+        const totalElapsedMs =
+          elapsedAccumMsRef.current +
+          (activeSegmentStartMsRef.current !== null
+            ? Math.max(0, now - activeSegmentStartMsRef.current)
+            : 0);
+        setElapsedTotalSec(Math.floor(totalElapsedMs / 1000));
+        return;
+      }
 
-        // Transition stage
+      // Advance across any stage boundaries crossed while running or suspended
+      let landedStage: TimerStage = currentStageNow;
+      let pendingTone: [number, number] | null = null;
+      let pendingVibrate: number[] | null = null;
+      let pendingCue: string | null = null;
+
+      while (
+        targetEndTime !== null &&
+        now >= targetEndTime &&
+        stageRef.current !== 'idle' &&
+        stageRef.current !== 'done'
+      ) {
         const s = stageRef.current;
+        let nextStageSec = 0;
+
         if (s === 'prep') {
           stageRef.current = 'work';
-          setStage('work');
-          playTone(960, 0.35);
-          if (navigator.vibrate) navigator.vibrate([180]);
-          if (voiceEnabled) {
-            speakCoachCue(`Ronda 1 de ${rounds}. ¡Empieza el trabajo!`);
-          }
-          return workSec;
-        }
-
-        if (s === 'work') {
-          if (restSec > 0 && !(roundRef.current === rounds && cycleRef.current === cycles)) {
-            stageRef.current = 'rest';
-            setStage('rest');
-            playTone(440, 0.3);
-            if (navigator.vibrate) navigator.vibrate([120, 80, 120]);
-            if (voiceEnabled) {
-              speakCoachCue(`Descansa ${restSec} segundos.`);
-            }
-            return restSec;
-          }
-        }
-
-        // Advance round / cycle
-        if (roundRef.current < rounds) {
+          landedStage = 'work';
+          nextStageSec = workSec;
+          pendingTone = [960, 0.35];
+          pendingVibrate = [180];
+          pendingCue = `Ronda 1 de ${rounds}. ¡Empieza el trabajo!`;
+        } else if (
+          s === 'work' &&
+          restSec > 0 &&
+          !(roundRef.current === rounds && cycleRef.current === cycles)
+        ) {
+          stageRef.current = 'rest';
+          landedStage = 'rest';
+          nextStageSec = restSec;
+          pendingTone = [440, 0.3];
+          pendingVibrate = [120, 80, 120];
+          pendingCue = `Descansa ${restSec} segundos.`;
+        } else if (roundRef.current < rounds) {
           roundRef.current += 1;
-          setCurrentRound(roundRef.current);
           stageRef.current = 'work';
-          setStage('work');
-          playTone(960, 0.35);
-          if (navigator.vibrate) navigator.vibrate([180]);
-          if (voiceEnabled) {
-            speakCoachCue(
-              roundRef.current === rounds
-                ? 'Última ronda. ¡Dale con todo!'
-                : `Ronda ${roundRef.current}. ¡Vamos!`,
-            );
-          }
-          return workSec;
-        }
-
-        if (cycleRef.current < cycles) {
+          landedStage = 'work';
+          nextStageSec = workSec;
+          pendingTone = [960, 0.35];
+          pendingVibrate = [180];
+          pendingCue =
+            roundRef.current === rounds
+              ? 'Última ronda. ¡Dale con todo!'
+              : `Ronda ${roundRef.current}. ¡Vamos!`;
+        } else if (cycleRef.current < cycles) {
           cycleRef.current += 1;
           roundRef.current = 1;
-          setCurrentCycle(cycleRef.current);
-          setCurrentRound(1);
           stageRef.current = 'work';
-          setStage('work');
-          playTone(960, 0.4);
-          if (voiceEnabled) {
-            speakCoachCue(`Bloque ${cycleRef.current} de ${cycles}. ¡Arranca!`);
-          }
-          return workSec;
+          landedStage = 'work';
+          nextStageSec = workSec;
+          pendingTone = [960, 0.4];
+          pendingVibrate = [180];
+          pendingCue = `Bloque ${cycleRef.current} de ${cycles}. ¡Arranca!`;
+        } else {
+          stageRef.current = 'done';
+          landedStage = 'done';
+          targetEndTime = null;
+          pendingTone = [1080, 0.45];
+          pendingVibrate = [250, 100, 250];
+          pendingCue = '¡Entrenamiento HIIT completado! Excelente trabajo.';
+          break;
         }
 
-        // Completed all rounds & cycles
-        stageRef.current = 'done';
-        setStage('done');
-        playTone(1080, 0.45);
-        if (navigator.vibrate) navigator.vibrate([250, 100, 250]);
-        if (voiceEnabled) {
-          speakCoachCue('¡Entrenamiento HIIT completado! Excelente trabajo.');
-        }
-        return 0;
-      });
-    }, 1000);
+        targetEndTime = targetEndTime + nextStageSec * 1000;
+      }
 
-    return () => window.clearInterval(timer);
-  }, [stage, workSec, restSec, rounds, cycles, voiceEnabled]);
+      targetEndTimeRef.current = targetEndTime;
+      lastWarningSecRef.current = null;
+      setCurrentRound(roundRef.current);
+      setCurrentCycle(cycleRef.current);
+      setStage(landedStage);
+
+      if (pendingTone) playTone(pendingTone[0], pendingTone[1]);
+      if (pendingVibrate && navigator.vibrate) navigator.vibrate(pendingVibrate);
+      if (pendingCue && voiceEnabledRef.current) speakCoachCue(pendingCue);
+
+      if (landedStage === 'done' || targetEndTime === null) {
+        if (activeSegmentStartMsRef.current !== null) {
+          elapsedAccumMsRef.current += Math.max(0, now - activeSegmentStartMsRef.current);
+          activeSegmentStartMsRef.current = null;
+        }
+        setRemainingSec(0);
+        const cappedSec = Math.min(
+          Math.floor(elapsedAccumMsRef.current / 1000),
+          5 + totalPlannedSec,
+        );
+        setElapsedTotalSec(cappedSec);
+      } else {
+        const nextRemaining = Math.max(0, Math.ceil((targetEndTime - now) / 1000));
+        setRemainingSec(nextRemaining);
+        const totalElapsedMs =
+          elapsedAccumMsRef.current +
+          (activeSegmentStartMsRef.current !== null
+            ? Math.max(0, now - activeSegmentStartMsRef.current)
+            : 0);
+        setElapsedTotalSec(Math.floor(totalElapsedMs / 1000));
+      }
+    };
+
+    const handleVisibilityChange = () => {
+      if (document.visibilityState === 'visible') {
+        syncTimer();
+      }
+    };
+
+    syncTimer();
+    const timer = window.setInterval(syncTimer, 200);
+    document.addEventListener('visibilitychange', handleVisibilityChange);
+
+    return () => {
+      window.clearInterval(timer);
+      document.removeEventListener('visibilitychange', handleVisibilityChange);
+    };
+  }, [stage, isPaused, workSec, restSec, rounds, cycles, totalPlannedSec]);
 
   const applyPreset = (p: HiitPreset) => {
     setPresetName(p.name);
@@ -247,9 +333,18 @@ export const HiitTimerSection: React.FC<HiitTimerSectionProps> = ({
   };
 
   const handleStart = () => {
+    const now = Date.now();
+    const prepMs = 5000;
     roundRef.current = 1;
     cycleRef.current = 1;
     stageRef.current = 'prep';
+    pausedRef.current = false;
+    targetEndTimeRef.current = now + prepMs;
+    pausedRemainingMsRef.current = prepMs;
+    elapsedAccumMsRef.current = 0;
+    activeSegmentStartMsRef.current = now;
+    lastWarningSecRef.current = null;
+
     setCurrentRound(1);
     setCurrentCycle(1);
     setElapsedTotalSec(0);
@@ -261,8 +356,43 @@ export const HiitTimerSection: React.FC<HiitTimerSectionProps> = ({
     }
   };
 
+  const handleTogglePause = () => {
+    if (stageRef.current === 'idle' || stageRef.current === 'done') return;
+    const now = Date.now();
+    if (!pausedRef.current) {
+      const remainingMs =
+        targetEndTimeRef.current !== null
+          ? Math.max(0, targetEndTimeRef.current - now)
+          : remainingSec * 1000;
+      pausedRemainingMsRef.current = remainingMs;
+      targetEndTimeRef.current = null;
+      if (activeSegmentStartMsRef.current !== null) {
+        elapsedAccumMsRef.current += Math.max(0, now - activeSegmentStartMsRef.current);
+        activeSegmentStartMsRef.current = null;
+      }
+      pausedRef.current = true;
+      setRemainingSec(Math.max(0, Math.ceil(remainingMs / 1000)));
+      setElapsedTotalSec(Math.floor(elapsedAccumMsRef.current / 1000));
+      setIsPaused(true);
+    } else {
+      const remainingMs = Math.max(0, pausedRemainingMsRef.current);
+      targetEndTimeRef.current = now + remainingMs;
+      activeSegmentStartMsRef.current = now;
+      pausedRef.current = false;
+      setRemainingSec(Math.max(0, Math.ceil(remainingMs / 1000)));
+      setIsPaused(false);
+    }
+  };
+
   const handleFinishAndSave = () => {
-    const duration = Math.max(10, elapsedTotalSec);
+    const now = Date.now();
+    const liveElapsedMs =
+      elapsedAccumMsRef.current +
+      (!pausedRef.current && activeSegmentStartMsRef.current !== null
+        ? Math.max(0, now - activeSegmentStartMsRef.current)
+        : 0);
+    const computedElapsedSec = Math.max(elapsedTotalSec, Math.floor(liveElapsedMs / 1000));
+    const duration = Math.max(10, computedElapsedSec);
     const kcal = Math.max(15, Math.round((duration / 60) * (profile.weightKg * 0.145)));
     onSaveHiitSession({
       id: `hiit_${Date.now()}`,
@@ -277,12 +407,25 @@ export const HiitTimerSection: React.FC<HiitTimerSectionProps> = ({
       completedAt: new Date().toISOString(),
     });
     stageRef.current = 'idle';
+    pausedRef.current = false;
+    targetEndTimeRef.current = null;
+    pausedRemainingMsRef.current = 0;
+    elapsedAccumMsRef.current = 0;
+    activeSegmentStartMsRef.current = null;
+    lastWarningSecRef.current = null;
+    setIsPaused(false);
     setStage('idle');
     setElapsedTotalSec(0);
   };
 
   const handleReset = () => {
     stageRef.current = 'idle';
+    pausedRef.current = false;
+    targetEndTimeRef.current = null;
+    pausedRemainingMsRef.current = 0;
+    elapsedAccumMsRef.current = 0;
+    activeSegmentStartMsRef.current = null;
+    lastWarningSecRef.current = null;
     setStage('idle');
     setIsPaused(false);
     setElapsedTotalSec(0);
@@ -508,7 +651,7 @@ export const HiitTimerSection: React.FC<HiitTimerSectionProps> = ({
               </button>
               <button
                 type="button"
-                onClick={() => setIsPaused((p) => !p)}
+                onClick={handleTogglePause}
                 className="min-h-[50px] rounded-2xl bg-white text-sm font-extrabold text-[#0A0B0D] flex items-center justify-center gap-1.5"
               >
                 {isPaused ? <Play className="w-4 h-4 fill-current" /> : <Pause className="w-4 h-4" />}

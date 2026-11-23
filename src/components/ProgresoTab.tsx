@@ -1,9 +1,12 @@
 import React, { useEffect, useMemo, useState } from 'react';
 import {
+  AlertCircle,
   BarChart3,
   Check,
   Download,
   Dumbbell,
+  FileText,
+  Flame,
   Footprints,
   GitCompareArrows,
   History,
@@ -27,8 +30,14 @@ import {
 } from 'recharts';
 import { calculateNutritionTargets } from '../data/foods';
 import { shiftIsoDate } from '../lib/compareDates';
+import { exportMonthlyClinicalReport } from '../lib/exportReports';
 import { createInitialMuscleFatigue } from '../lib/recovery';
-import { type RecordDeleteTarget, getLocalDateKey, getTodayIsoDate } from '../lib/storage';
+import { computeStreakAnalytics } from '../lib/streakEngine';
+import {
+  type RecordDeleteTarget,
+  getActiveProfileId,
+  getLocalDateKey,
+} from '../lib/storage';
 import {
   formatDistance,
   formatVolume,
@@ -60,6 +69,7 @@ const DarkCompareSkeleton: React.FC = () => (
 );
 
 interface ProgresoTabProps {
+  profileId?: string;
   database?: AppDatabase;
   profile: UserProfile;
   onUpdateProfile?: (profile: UserProfile) => void;
@@ -138,6 +148,7 @@ const CompositionTooltip: React.FC<{
 };
 
 export const ProgresoTab: React.FC<ProgresoTabProps> = ({
+  profileId,
   database,
   profile,
   onUpdateProfile,
@@ -169,6 +180,11 @@ export const ProgresoTab: React.FC<ProgresoTabProps> = ({
   } | null>(null);
   const [isGeneratingCard, setIsGeneratingCard] = useState(false);
   const [shareFeedback, setShareFeedback] = useState<string | null>(null);
+  const [isExportingClinicalReport, setIsExportingClinicalReport] = useState(false);
+  const [clinicalReportNotice, setClinicalReportNotice] = useState<{
+    tone: 'warning' | 'success';
+    text: string;
+  } | null>(null);
 
   useEffect(() => {
     if (openHistorialSignal > 0) setSubTab('historial');
@@ -193,7 +209,8 @@ export const ProgresoTab: React.FC<ProgresoTabProps> = ({
 
   const weightUnit = getWeightUnit(profile.weightUnit);
   const distanceUnit = getDistanceUnit(profile.distanceUnit);
-  const todayIso = getTodayIsoDate();
+  const todayIso = new Date().toLocaleDateString('en-CA');
+  const [selectedHeatmapDate, setSelectedHeatmapDate] = useState<string | null>(null);
 
   const handleToggleWeightUnit = (unit: WeightUnit) => {
     if (!onUpdateProfile || unit === weightUnit) return;
@@ -370,6 +387,16 @@ export const ProgresoTab: React.FC<ProgresoTabProps> = ({
   );
   const recordedSleepPoints = sleepChartPoints.filter((p) => p.hours !== null);
 
+  const streakAnalytics = useMemo(
+    () => computeStreakAnalytics(effectiveDatabase, todayIso),
+    [effectiveDatabase, todayIso],
+  );
+
+  const selectedHeatmapCell = useMemo(() => {
+    if (!selectedHeatmapDate) return null;
+    return streakAnalytics.cells.find((c) => c.date === selectedHeatmapDate) ?? null;
+  }, [streakAnalytics.cells, selectedHeatmapDate]);
+
   const handleOpenWeeklyShareCard = async () => {
     setIsGeneratingCard(true);
     setShareFeedback(null);
@@ -402,6 +429,39 @@ export const ProgresoTab: React.FC<ProgresoTabProps> = ({
     );
   };
 
+  const handleExportClinicalReport = () => {
+    if (isExportingClinicalReport) return;
+    const activeProfileId = profileId || getActiveProfileId();
+    setIsExportingClinicalReport(true);
+    setClinicalReportNotice(null);
+    // Invoke synchronously within the click gesture so window.open isn't blocked
+    void exportMonthlyClinicalReport(activeProfileId)
+      .then((res) => {
+        if (!res.ok) {
+          setClinicalReportNotice({
+            tone: 'warning',
+            text:
+              res.message ||
+              'No hay datos suficientes en los últimos 30 días para generar el reporte clínico.',
+          });
+        } else {
+          setClinicalReportNotice({
+            tone: 'success',
+            text: `Reporte Clínico (${res.rangeStart} → ${res.rangeEnd}) listo para imprimir o guardar en PDF.`,
+          });
+        }
+      })
+      .catch(() => {
+        setClinicalReportNotice({
+          tone: 'warning',
+          text: 'No se pudo compilar el reporte clínico en este momento.',
+        });
+      })
+      .finally(() => {
+        setIsExportingClinicalReport(false);
+      });
+  };
+
   return (
     <div className="space-y-5 pb-8">
       {/* Header + Generate Weekly Card CTA + KG|LB Switch */}
@@ -421,6 +481,22 @@ export const ProgresoTab: React.FC<ProgresoTabProps> = ({
           </div>
 
           <div className="flex flex-wrap items-center gap-2 shrink-0">
+            <button
+              type="button"
+              onClick={handleExportClinicalReport}
+              disabled={isExportingClinicalReport}
+              className="min-h-[38px] inline-flex items-center gap-1.5 rounded-xl border border-[#2C3344] bg-[#12141A] hover:border-[#D4FF33]/60 px-3.5 text-xs font-extrabold text-white active:scale-[0.98] disabled:opacity-60"
+            >
+              {isExportingClinicalReport ? (
+                <Loader2 className="w-4 h-4 animate-spin text-[#D4FF33]" />
+              ) : (
+                <FileText className="w-4 h-4 text-[#D4FF33]" />
+              )}
+              {isExportingClinicalReport
+                ? 'Compilando 30d...'
+                : 'Exportar Reporte Clínico (30d PDF)'}
+            </button>
+
             <button
               type="button"
               onClick={() => void handleOpenWeeklyShareCard()}
@@ -461,6 +537,34 @@ export const ProgresoTab: React.FC<ProgresoTabProps> = ({
             </div>
           </div>
         </div>
+
+        {clinicalReportNotice && (
+          <div
+            role={clinicalReportNotice.tone === 'warning' ? 'alert' : 'status'}
+            className={`rounded-2xl border px-3.5 py-2.5 flex items-center justify-between gap-3 text-xs font-semibold ${
+              clinicalReportNotice.tone === 'warning'
+                ? 'border-amber-400/40 bg-amber-500/10 text-amber-200'
+                : 'border-emerald-400/35 bg-emerald-500/10 text-emerald-200'
+            }`}
+          >
+            <div className="flex items-center gap-2">
+              {clinicalReportNotice.tone === 'warning' ? (
+                <AlertCircle className="w-4 h-4 shrink-0 text-amber-300" />
+              ) : (
+                <Check className="w-4 h-4 shrink-0 text-emerald-300" />
+              )}
+              <span>{clinicalReportNotice.text}</span>
+            </div>
+            <button
+              type="button"
+              onClick={() => setClinicalReportNotice(null)}
+              aria-label="Cerrar aviso de reporte clínico"
+              className="p-1 rounded-lg hover:bg-white/10 text-current shrink-0"
+            >
+              <X className="w-3.5 h-3.5" />
+            </button>
+          </div>
+        )}
 
         {/* 3 Clean Sub-tabs: Evolución | Comparar | Historial */}
         <div
@@ -884,6 +988,139 @@ export const ProgresoTab: React.FC<ProgresoTabProps> = ({
               )}
             </section>
           </div>
+
+          {/* Análisis de Racha (Heatmap 28 días · L M X J V S D) */}
+          <section
+            aria-label="Análisis de Racha"
+            className="rounded-3xl border border-[#222631] bg-[#12141A] p-4 sm:p-5 space-y-4"
+          >
+            <div className="flex flex-wrap items-start justify-between gap-3">
+              <div>
+                <div className="flex items-center gap-2 text-xs font-bold text-[#a3e635]">
+                  <Flame className="w-4 h-4" />
+                  <span>Consistencia y Escudo de Descanso</span>
+                </div>
+                <h2 className="mt-0.5 text-lg sm:text-xl font-extrabold font-display text-white">
+                  Análisis de Racha
+                </h2>
+                <p className="text-[11px] text-zinc-400">
+                  Últimos 28 días cerrando el domingo de la semana actual ({streakAnalytics.startIso} → {streakAnalytics.endSundayIso})
+                </p>
+              </div>
+
+              <div className="flex flex-wrap items-center gap-3 text-[11px] font-semibold text-zinc-300">
+                <span className="inline-flex items-center gap-1.5">
+                  <span className="w-3 h-3 rounded bg-lime-400 border border-lime-300 inline-block" />
+                  Entrenado
+                </span>
+                <span className="inline-flex items-center gap-1.5">
+                  <span className="w-3 h-3 rounded bg-sky-500/20 border border-sky-500/40 inline-block" />
+                  Descanso / Pausa
+                </span>
+                <span className="inline-flex items-center gap-1.5">
+                  <span className="w-3 h-3 rounded bg-zinc-900/80 border border-zinc-800 inline-block" />
+                  Sin actividad
+                </span>
+              </div>
+            </div>
+
+            {/* 3 KPIs: Racha actual, Mejor racha histórica, Consistencia del periodo */}
+            <div className="grid grid-cols-3 gap-2.5">
+              <div className="rounded-2xl border border-[#222631] bg-[#0D0F14] p-3">
+                <p className="text-[11px] text-zinc-400">Racha actual</p>
+                <p className="mt-1 text-xl font-extrabold font-mono tabular-nums text-[#a3e635]">
+                  {streakAnalytics.currentStreakDays}{' '}
+                  <span className="text-xs font-bold text-zinc-400">
+                    {streakAnalytics.currentStreakDays === 1 ? 'día' : 'días'}
+                  </span>
+                </p>
+              </div>
+              <div className="rounded-2xl border border-[#222631] bg-[#0D0F14] p-3">
+                <p className="text-[11px] text-zinc-400">Mejor racha histórica</p>
+                <p className="mt-1 text-xl font-extrabold font-mono tabular-nums text-white">
+                  {streakAnalytics.bestStreakDays}{' '}
+                  <span className="text-xs font-bold text-zinc-400">
+                    {streakAnalytics.bestStreakDays === 1 ? 'día' : 'días'}
+                  </span>
+                </p>
+              </div>
+              <div className="rounded-2xl border border-[#222631] bg-[#0D0F14] p-3">
+                <p className="text-[11px] text-zinc-400">Consistencia (28d)</p>
+                <p className="mt-1 text-xl font-extrabold font-mono tabular-nums text-sky-300">
+                  {streakAnalytics.consistencyPct}%
+                </p>
+                <p className="text-[10px] text-zinc-500 truncate">
+                  {streakAnalytics.trainedDays28d} entreno · {streakAnalytics.restOrPauseDays28d} desc/pausa
+                </p>
+              </div>
+            </div>
+
+            {/* 7-column Calendar Heatmap (L M X J V S D) */}
+            <div className="rounded-2xl border border-[#1E2330] bg-[#0D0F14] p-3 sm:p-4 space-y-2">
+              <div className="grid grid-cols-7 gap-1.5 text-center text-[11px] font-extrabold text-zinc-400">
+                {(['L', 'M', 'X', 'J', 'V', 'S', 'D'] as const).map((hdr) => (
+                  <span key={hdr}>{hdr}</span>
+                ))}
+              </div>
+
+              <div className="grid grid-cols-7 gap-1.5">
+                {streakAnalytics.cells.map((cell) => {
+                  const isSelected = selectedHeatmapDate === cell.date;
+                  const cellTone =
+                    cell.status === 'trained'
+                      ? 'bg-lime-400 border-lime-300 text-[#0A0B0D] font-extrabold'
+                      : cell.status === 'rest_or_pause'
+                        ? 'bg-sky-500/20 border-sky-500/40 text-sky-200 font-bold'
+                        : cell.status === 'future'
+                          ? 'bg-zinc-900/40 border-zinc-800/60 text-zinc-600 opacity-55'
+                          : 'bg-zinc-900/80 border-zinc-800 text-zinc-400';
+
+                  return (
+                    <button
+                      key={cell.date}
+                      type="button"
+                      onClick={() =>
+                        setSelectedHeatmapDate((prev) =>
+                          prev === cell.date ? null : cell.date,
+                        )
+                      }
+                      title={`${cell.date} · ${cell.label}`}
+                      aria-label={`${cell.date}: ${cell.label}`}
+                      aria-pressed={isSelected}
+                      className={`min-h-[38px] rounded-xl border flex flex-col items-center justify-center text-xs font-mono tabular-nums transition-transform active:scale-95 ${cellTone} ${
+                        cell.isToday
+                          ? 'ring-2 ring-[#D4FF33] ring-offset-1 ring-offset-[#0D0F14]'
+                          : isSelected
+                            ? 'ring-2 ring-white/70'
+                            : ''
+                      }`}
+                    >
+                      <span>{cell.dayNumber}</span>
+                    </button>
+                  );
+                })}
+              </div>
+
+              {selectedHeatmapCell && (
+                <div className="pt-1.5 flex items-center justify-between gap-2 text-xs border-t border-white/5">
+                  <span className="font-mono text-zinc-300">
+                    {formatShortDateEs(selectedHeatmapCell.date)} ({selectedHeatmapCell.date})
+                  </span>
+                  <span
+                    className={`font-bold ${
+                      selectedHeatmapCell.status === 'trained'
+                        ? 'text-[#a3e635]'
+                        : selectedHeatmapCell.status === 'rest_or_pause'
+                          ? 'text-sky-300'
+                          : 'text-zinc-400'
+                    }`}
+                  >
+                    {selectedHeatmapCell.label}
+                  </span>
+                </div>
+              )}
+            </div>
+          </section>
 
           {/* Calendario Mensual de Entrenamientos */}
           <WorkoutCalendarAnalyticsCard database={effectiveDatabase} />

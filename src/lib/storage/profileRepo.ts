@@ -90,7 +90,56 @@ export function normalizeUserProfile(
         ? rawProfile.lowPowerMode
         : 'auto',
     rpeTrackingEnabled: rawProfile?.rpeTrackingEnabled !== false,
+    customGoal:
+      typeof rawProfile?.customGoal === 'string' && rawProfile.customGoal.trim()
+        ? rawProfile.customGoal.trim().slice(0, 140)
+        : undefined,
+    onboardingCompleted:
+      typeof rawProfile?.onboardingCompleted === 'boolean'
+        ? rawProfile.onboardingCompleted
+        : undefined,
   };
+}
+
+const LS_CUSTOM_GOAL_PREFIX = 'pulsofit_custom_goal_v1_';
+
+export function getSavedCustomGoal(profileId: string): string {
+  if (typeof window === 'undefined' || !profileId) return '';
+  try {
+    return (window.localStorage.getItem(`${LS_CUSTOM_GOAL_PREFIX}${profileId}`) ?? '').trim();
+  } catch {
+    return '';
+  }
+}
+
+export function saveCustomGoalToLocal(profileId: string, customGoal: string): void {
+  if (typeof window === 'undefined' || !profileId) return;
+  try {
+    const clean = customGoal.trim().slice(0, 140);
+    const key = `${LS_CUSTOM_GOAL_PREFIX}${profileId}`;
+    if (clean) {
+      window.localStorage.setItem(key, clean);
+    } else {
+      window.localStorage.removeItem(key);
+    }
+  } catch {
+    // Ignore storage quota errors
+  }
+}
+
+export function isProfileUncalibrated(db: AppDatabase, profileId?: string): boolean {
+  if (db.profile.onboardingCompleted) return false;
+  if (db.profile.customGoal && db.profile.customGoal.trim().length > 0) return false;
+  if (profileId && getSavedCustomGoal(profileId).length > 0) return false;
+  const hasHistory =
+    db.workouts.length > 0 ||
+    db.foodLogs.length > 0 ||
+    db.bodyScans.length > 0 ||
+    (db.cardioSessions?.length ?? 0) > 0 ||
+    (db.hiitSessions?.length ?? 0) > 0 ||
+    (db.sleepSessions?.length ?? 0) > 0 ||
+    (db.pulseHrvRecords?.length ?? 0) > 0;
+  return !hasHistory;
 }
 
 export function normalizeReadinessMap(

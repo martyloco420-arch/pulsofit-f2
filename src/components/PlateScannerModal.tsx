@@ -72,52 +72,68 @@ const MEAL_SLOT_LABELS: Record<MealType, string> = {
   snack: 'Snack',
 };
 
+const PLATE_IMAGE_MAX_SIDE_PX = 1024;
+const PLATE_IMAGE_JPEG_QUALITY = 0.8;
+
 async function compressImageToJpegBase64(file: File): Promise<{
   previewUrl: string;
   base64: string;
   mimeType: string;
 }> {
-  const dataUrl = await new Promise<string>((resolve, reject) => {
-    const reader = new FileReader();
-    reader.onload = () => resolve(String(reader.result || ''));
-    reader.onerror = () => reject(new Error('No se pudo leer la imagen seleccionada.'));
-    reader.readAsDataURL(file);
-  });
+  const objectUrl = URL.createObjectURL(file);
 
-  // Compress captured phone photos to max 800px width and 0.75 JPEG quality for fast upload and storage
-  const img = await new Promise<HTMLImageElement>((resolve, reject) => {
-    const image = new Image();
-    image.onload = () => resolve(image);
-    image.onerror = () => reject(new Error('Formato de imagen no compatible.'));
-    image.src = dataUrl;
-  });
+  try {
+    const img = await new Promise<HTMLImageElement>((resolve, reject) => {
+      const image = new Image();
+      image.onload = () => resolve(image);
+      image.onerror = () =>
+        reject(new Error('Formato de imagen no compatible.'));
+      image.src = objectUrl;
+    });
 
-  const maxWidth = 800;
-  const scale = img.width > maxWidth ? maxWidth / img.width : 1;
-  const width = Math.max(1, Math.round(img.width * scale));
-  const height = Math.max(1, Math.round(img.height * scale));
+    const srcWidth = img.naturalWidth || img.width;
+    const srcHeight = img.naturalHeight || img.height;
+    const longestSide = Math.max(srcWidth, srcHeight);
+    const scale =
+      longestSide > PLATE_IMAGE_MAX_SIDE_PX
+        ? PLATE_IMAGE_MAX_SIDE_PX / longestSide
+        : 1;
+    const width = Math.max(
+      1,
+      Math.min(PLATE_IMAGE_MAX_SIDE_PX, Math.round(srcWidth * scale)),
+    );
+    const height = Math.max(
+      1,
+      Math.min(PLATE_IMAGE_MAX_SIDE_PX, Math.round(srcHeight * scale)),
+    );
 
-  const canvas = document.createElement('canvas');
-  canvas.width = width;
-  canvas.height = height;
-  const ctx = canvas.getContext('2d');
-  if (!ctx) {
-    const commaIdx = dataUrl.indexOf(',');
+    const offscreenCanvas = document.createElement('canvas');
+    offscreenCanvas.width = width;
+    offscreenCanvas.height = height;
+    const ctx = offscreenCanvas.getContext('2d');
+    if (!ctx) {
+      throw new Error('No se pudo inicializar el lienzo de compresión.');
+    }
+
+    ctx.fillStyle = '#FFFFFF';
+    ctx.fillRect(0, 0, width, height);
+    ctx.imageSmoothingEnabled = true;
+    ctx.imageSmoothingQuality = 'high';
+    ctx.drawImage(img, 0, 0, width, height);
+
+    const jpegUrl = offscreenCanvas.toDataURL(
+      'image/jpeg',
+      PLATE_IMAGE_JPEG_QUALITY,
+    );
+    const commaIdx = jpegUrl.indexOf(',');
     return {
-      previewUrl: dataUrl,
-      base64: commaIdx >= 0 ? dataUrl.slice(commaIdx + 1) : dataUrl,
-      mimeType: file.type || 'image/jpeg',
+      previewUrl: jpegUrl,
+      base64: commaIdx >= 0 ? jpegUrl.slice(commaIdx + 1) : jpegUrl,
+      mimeType: 'image/jpeg',
     };
+  } finally {
+    URL.revokeObjectURL(objectUrl);
   }
-
-  ctx.drawImage(img, 0, 0, width, height);
-  const jpegUrl = canvas.toDataURL('image/jpeg', 0.75);
-  const commaIdx = jpegUrl.indexOf(',');
-  return {
-    previewUrl: jpegUrl,
-    base64: commaIdx >= 0 ? jpegUrl.slice(commaIdx + 1) : jpegUrl,
-    mimeType: 'image/jpeg',
-  };
 }
 
 export const PlateScannerModal: React.FC<PlateScannerModalProps> = ({

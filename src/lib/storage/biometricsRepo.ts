@@ -9,10 +9,13 @@ import type {
   SleepTimelinePoint,
 } from '../../types/fitness';
 import {
+  LS_ACTIVE_PROFILE_KEY,
   type RecordDeleteTarget,
   dedupeById,
   getLocalDateKey,
   getTodayIsoDate,
+  readRawProfileFromLegacyStorage,
+  readRawProfileFromPulsoFitDB,
   resolveDeleteIndex,
   safeNum,
   safeStr,
@@ -503,4 +506,217 @@ export function filterBiometricsDomainByDate(
     progressPhotos: nextPhotos,
     deletedPhotoIds,
   };
+}
+
+export type HrvRhrRangeDays = 7 | 14 | 30 | 90;
+
+export interface HrvRhrDailyPoint {
+  date: string; // YYYY-MM-DD local
+  shortDate: string; // e.g. 12 nov
+  fullDate: string; // e.g. jue, 12 nov 2026
+  avgHrvMs: number | null;
+  avgRhrBpm: number | null;
+  sampleCount: number;
+}
+
+export interface HrvRhrTrendSummary {
+  profileId: string;
+  rangeDays: HrvRhrRangeDays;
+  startDate: string;
+  endDate: string;
+  points: HrvRhrDailyPoint[];
+  daysWithData: number;
+  totalMeasurements: number;
+  avgHrvMs: number | null;
+  avgRhrBpm: number | null;
+  avgHrv30dMs: number | null;
+  avgRhr30dBpm: number | null;
+  minHrvMs: number | null;
+  maxHrvMs: number | null;
+  minRhrBpm: number | null;
+  maxRhrBpm: number | null;
+}
+
+export type HrvRhr30dSummary = HrvRhrTrendSummary;
+
+function shiftLocalCalendarDate(baseIso: string, deltaDays: number): string {
+  const parts = baseIso.split('-').map(Number);
+  if (parts.length !== 3 || parts.some((n) => !Number.isFinite(n))) {
+    const dt = new Date();
+    dt.setDate(dt.getDate() + deltaDays);
+    return dt.toLocaleDateString('en-CA');
+  }
+  const dt = new Date(parts[0], parts[1] - 1, parts[2], 12, 0, 0, 0);
+  dt.setDate(dt.getDate() + deltaDays);
+  return dt.toLocaleDateString('en-CA');
+}
+
+function formatChartDayLabels(isoDate: string): { shortDate: string; fullDate: string } {
+  const [y, m, d] = isoDate.split('-').map(Number);
+  const dt = new Date(y, (m || 1) - 1, d || 1, 12, 0, 0, 0);
+  if (Number.isNaN(dt.getTime())) {
+    return { shortDate: isoDate, fullDate: isoDate };
+  }
+  const shortDate = dt
+    .toLocaleDateString('es-MX', { day: 'numeric', month: 'short' })
+    .replace('.', '');
+  const fullDate = dt.toLocaleDateString('es-MX', {
+    weekday: 'short',
+    day: 'numeric',
+    month: 'short',
+    year: 'numeric',
+  });
+  return { shortDate, fullDate };
+}
+
+export function computeHrvRhrTrend(
+  records: PulseHrvRecord[],
+  rangeDays: HrvRhrRangeDays = 30,
+  profileId = 'main',
+  todayIso = new Date().toLocaleDateString('en-CA'),
+): HrvRhrTrendSummary {
+  const endDate = /^\d{4}-\d{2}-\d{2}$/.test(todayIso)
+    ? todayIso
+    : new Date().toLocaleDateString('en-CA');
+  const startOffset = -(rangeDays - 1);
+  const startDate = shiftLocalCalendarDate(endDate, startOffset);
+
+  const groupedByDate = new Map<string, PulseHrvRecord[]>();
+  for (const rec of records) {
+    const localDate = getLocalDateKey(rec.date || rec.recordedAt);
+    if (localDate < startDate || localDate > endDate) continue;
+    const list = groupedByDate.get(localDate) ?? [];
+    list.push(rec);
+    groupedByDate.set(localDate, list);
+  }
+
+  const points: HrvRhrDailyPoint[] = [];
+  let daysWithData = 0;
+  let totalMeasurements = 0;
+  const allHrvValues: number[] = [];
+  const allRhrValues: number[] = [];
+
+  for (let offset = startOffset; offset <= 0; offset += 1) {
+    const date = shiftLocalCalendarDate(endDate, offset);
+    const dayRecords = groupedByDate.get(date) ?? [];
+    const hrvList = dayRecords
+      .map((r) => r.hrvRmssdMs)
+      .filter((v) => Number.isFinite(v) && v > 0);
+    const rhrList = dayRecords
+      .map((r) => r.bpm)
+      .filter((v) => Number.isFinite(v) && v > 0);
+
+    const avgHrvMs =
+      hrvList.length > 0
+        ? Math.round(hrvList.reduce((acc, v) => acc + v, 0) / hrvList.length)
+        : null;
+    const avgRhrBpm =
+      rhrList.length > 0
+        ? Math.round(rhrList.reduce((acc, v) => acc + v, 0) / rhrList.length)
+        : null;
+
+    if (avgHrvMs !== null || avgRhrBpm !== null) {
+      daysWithData += 1;
+    }
+    totalMeasurements += dayRecords.length;
+    allHrvValues.push(...hrvList);
+    allRhrValues.push(...rhrList);
+
+    const labels = formatChartDayLabels(date);
+    points.push({
+      date,
+      shortDate: labels.shortDate,
+      fullDate: labels.fullDate,
+      avgHrvMs,
+      avgRhrBpm,
+      sampleCount: dayRecords.length,
+    });
+  }
+
+  const avgHrvMs =
+    allHrvValues.length > 0
+      ? Math.round(allHrvValues.reduce((acc, v) => acc + v, 0) / allHrvValues.length)
+      : null;
+  const avgRhrBpm =
+    allRhrValues.length > 0
+      ? Math.round(allRhrValues.reduce((acc, v) => acc + v, 0) / allRhrValues.length)
+      : null;
+
+  return {
+    profileId,
+    rangeDays,
+    startDate,
+    endDate,
+    points,
+    daysWithData,
+    totalMeasurements,
+    avgHrvMs,
+    avgRhrBpm,
+    avgHrv30dMs: avgHrvMs,
+    avgRhr30dBpm: avgRhrBpm,
+    minHrvMs: allHrvValues.length > 0 ? Math.min(...allHrvValues) : null,
+    maxHrvMs: allHrvValues.length > 0 ? Math.max(...allHrvValues) : null,
+    minRhrBpm: allRhrValues.length > 0 ? Math.min(...allRhrValues) : null,
+    maxRhrBpm: allRhrValues.length > 0 ? Math.max(...allRhrValues) : null,
+  };
+}
+
+export function computeHrvRhr30dTrend(
+  records: PulseHrvRecord[],
+  profileId = 'main',
+  todayIso = new Date().toLocaleDateString('en-CA'),
+): HrvRhrTrendSummary {
+  return computeHrvRhrTrend(records, 30, profileId, todayIso);
+}
+
+function resolveCurrentProfileIdSafe(profileId?: string): string {
+  if (typeof profileId === 'string' && profileId.trim()) {
+    return profileId.trim();
+  }
+  if (typeof window !== 'undefined') {
+    try {
+      const stored = window.localStorage.getItem(LS_ACTIVE_PROFILE_KEY);
+      if (stored && stored.trim()) return stored.trim();
+    } catch {
+      // Ignore storage access errors
+    }
+  }
+  return 'main';
+}
+
+export async function loadActiveProfileHrvRhrTrend(
+  rangeDays: HrvRhrRangeDays = 30,
+  profileId?: string,
+  todayIso?: string,
+): Promise<HrvRhrTrendSummary> {
+  const resolvedProfileId = resolveCurrentProfileIdSafe(profileId);
+  let raw: Partial<AppDatabase> | null = null;
+  try {
+    raw = await readRawProfileFromPulsoFitDB(resolvedProfileId);
+  } catch {
+    raw = null;
+  }
+  if (!raw) {
+    try {
+      raw = await readRawProfileFromLegacyStorage(resolvedProfileId);
+    } catch {
+      raw = null;
+    }
+  }
+
+  const nowIso = new Date().toISOString();
+  const records = dedupeById(
+    (Array.isArray(raw?.pulseHrvRecords) ? raw.pulseHrvRecords : []).map((rec, idx) =>
+      normalizePulseRecord(rec ?? {}, idx, nowIso),
+    ),
+  );
+
+  return computeHrvRhrTrend(records, rangeDays, resolvedProfileId, todayIso);
+}
+
+export async function loadActiveProfileHrvRhr30d(
+  profileId?: string,
+  todayIso?: string,
+): Promise<HrvRhrTrendSummary> {
+  return loadActiveProfileHrvRhrTrend(30, profileId, todayIso);
 }

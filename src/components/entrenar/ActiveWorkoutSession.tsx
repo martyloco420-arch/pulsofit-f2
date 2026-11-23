@@ -1,4 +1,4 @@
-import React, { useMemo, useState } from 'react';
+import React, { useEffect, useMemo, useRef, useState } from 'react';
 import {
   Activity,
   AlertTriangle,
@@ -19,13 +19,16 @@ import {
   SkipForward,
   Timer,
   TrendingUp,
+  Trophy,
   Volume2,
   VolumeX,
 } from 'lucide-react';
+import { useHardwareManager } from '../../hooks/useHardwareManager';
+import { getPreviousExerciseSets } from '../../lib/analytics';
 import {
-  computeProgressiveOverloadHint,
-  getPreviousExerciseSets,
-} from '../../lib/analytics';
+  computeAutoregulatedOverload,
+  evaluateWorkoutPRs,
+} from '../../lib/progressiveOverload';
 import {
   computeHeartRateZone,
   isBluetoothHeartRateSupported,
@@ -112,6 +115,7 @@ export interface ActiveWorkoutSessionProps {
     hrvMs?: number | null;
     stressLabel: string;
   };
+  decayedFatigue?: Record<MuscleGroup, number>;
   sleepPulseAlert: { elevatedPulse?: boolean } | null;
   activeRpePrompt: { exIdx: number; setIdx: number } | null;
   setActiveRpePrompt: React.Dispatch<
@@ -215,6 +219,7 @@ export const ActiveWorkoutSession: React.FC<ActiveWorkoutSessionProps> = ({
   restRemaining,
   restTotal,
   recoveryIndex,
+  decayedFatigue,
   sleepPulseAlert,
   activeRpePrompt,
   setActiveRpePrompt,
@@ -252,6 +257,19 @@ export const ActiveWorkoutSession: React.FC<ActiveWorkoutSessionProps> = ({
   const [combinedBandTargetExId, setCombinedBandTargetExId] = useState<
     string | null
   >(null);
+
+  const hardware = useHardwareManager();
+  const hardwareRef = useRef(hardware);
+  hardwareRef.current = hardware;
+
+  useEffect(() => {
+    void hardwareRef.current.acquireWakeLock('active-workout');
+    return () => {
+      void hardwareRef.current.releaseWakeLock('active-workout');
+    };
+  }, [activeWorkout.id]);
+
+  const effectiveWakeLockActive = hardware.wakeLockActive || wakeLockActive;
 
   const activeExercises = activeWorkout.exercises ?? [];
   const completedSetsCount =
@@ -293,6 +311,11 @@ export const ActiveWorkoutSession: React.FC<ActiveWorkoutSessionProps> = ({
     return map;
   }, [activeExercises]);
 
+  const livePrWorkout = useMemo(
+    () => evaluateWorkoutPRs(activeWorkout, workouts),
+    [activeWorkout, workouts],
+  );
+
   const hrZone = hrBpm ? computeHeartRateZone(hrBpm, profile.age) : null;
 
   const updateExerciseNotes = (exIdx: number, notes: string) => {
@@ -312,7 +335,7 @@ export const ActiveWorkoutSession: React.FC<ActiveWorkoutSessionProps> = ({
               <p className="text-xs font-semibold text-[#D4FF33]">
                 Entrenamiento en vivo
               </p>
-              {wakeLockActive && (
+              {effectiveWakeLockActive && (
                 <span className="text-[11px] font-semibold text-emerald-300">
                   · Pantalla activa
                 </span>
@@ -736,19 +759,17 @@ export const ActiveWorkoutSession: React.FC<ActiveWorkoutSessionProps> = ({
               !!ex.supersetGroupId &&
               activeWorkout.exercises[exIdx + 1]?.supersetGroupId ===
                 ex.supersetGroupId;
-            const overloadHint = computeProgressiveOverloadHint(
-              previousLog?.sets,
+            const liveEx = livePrWorkout.exercises[exIdx] ?? ex;
+            const exerciseHasPR = liveEx.sets.some((s) => s.isPR);
+            const overloadHint = computeAutoregulatedOverload({
+              exercise: ex,
+              workouts,
               weightUnit,
-              loadMode,
-              {
-                recoveryPct: recoveryIndex.score,
-                elevatedPulse: Boolean(sleepPulseAlert?.elevatedPulse),
-                restingBpm: recoveryIndex.bpm ?? undefined,
-                hrvMs: recoveryIndex.hrvMs ?? undefined,
-                stressLabel: recoveryIndex.stressLabel,
-                currentBandIds,
-              },
-            );
+              systemicRecoveryPct: recoveryIndex.score,
+              decayedFatigueMap: decayedFatigue,
+              elevatedPulse: Boolean(sleepPulseAlert?.elevatedPulse),
+              restingBpm: recoveryIndex.bpm ?? null,
+            });
             const appliedBanner = overloadAppliedNote[ex.id];
 
             return (
@@ -769,24 +790,58 @@ export const ActiveWorkoutSession: React.FC<ActiveWorkoutSessionProps> = ({
                         Superserie {supersetLetter}
                       </span>
                     )}
-                    <button
-                      type="button"
-                      onClick={() =>
-                        onInspectExercise({
-                          name: ex.name,
-                          primaryMuscles: ex.primaryMuscles,
-                          secondaryMuscles: ex.secondaryMuscles,
-                          notes: ex.notes,
-                          activeIdx: exIdx,
-                        })
-                      }
-                      className="text-left group inline-flex items-center gap-2 max-w-full"
-                    >
-                      <h3 className="text-xl font-bold font-display text-white group-hover:text-[#D4FF33] transition-colors">
-                        {ex.name}
-                      </h3>
-                      <Info className="w-4 h-4 text-[#D4FF33] shrink-0" />
-                    </button>
+                    <div className="flex flex-wrap items-center gap-2">
+                      <button
+                        type="button"
+                        onClick={() =>
+                          onInspectExercise({
+                            name: ex.name,
+                            primaryMuscles: ex.primaryMuscles,
+                            secondaryMuscles: ex.secondaryMuscles,
+                            notes: ex.notes,
+                            activeIdx: exIdx,
+                          })
+                        }
+                        className="text-left group inline-flex items-center gap-2 max-w-full"
+                      >
+                        <h3 className="text-xl font-bold font-display text-white group-hover:text-[#D4FF33] transition-colors">
+                          {ex.name}
+                        </h3>
+                        <Info className="w-4 h-4 text-[#D4FF33] shrink-0" />
+                      </button>
+
+                      {overloadHint && (
+                        <span
+                          title={overloadHint.rationale}
+                          className={`inline-flex items-center gap-1 rounded-full border px-2.5 py-0.5 text-[11px] font-bold tracking-tight shrink-0 ${
+                            overloadHint.status === 'progress'
+                              ? 'border-emerald-400/40 bg-emerald-500/15 text-emerald-200'
+                              : overloadHint.status === 'deload'
+                                ? 'border-rose-400/40 bg-rose-500/15 text-rose-200'
+                                : overloadHint.status === 'hold_low_recovery'
+                                  ? 'border-amber-400/40 bg-amber-500/15 text-amber-200'
+                                  : 'border-sky-400/40 bg-sky-500/15 text-sky-200'
+                          }`}
+                        >
+                          {overloadHint.status === 'progress' ? (
+                            <TrendingUp className="w-3 h-3 shrink-0" />
+                          ) : overloadHint.status === 'deload' ||
+                            overloadHint.status === 'hold_low_recovery' ? (
+                            <AlertTriangle className="w-3 h-3 shrink-0" />
+                          ) : (
+                            <Activity className="w-3 h-3 shrink-0" />
+                          )}
+                          {overloadHint.pillLabel}
+                        </span>
+                      )}
+
+                      {exerciseHasPR && (
+                        <span className="inline-flex items-center gap-1 rounded-full border border-amber-400/60 bg-gradient-to-r from-amber-400/20 to-[#D4FF33]/20 px-2 py-0.5 text-[10px] font-extrabold uppercase tracking-wider text-[#D4FF33] shrink-0">
+                          <Trophy className="w-3 h-3 text-amber-300" />
+                          PR
+                        </span>
+                      )}
+                    </div>
                     <p className="text-xs font-mono text-[#D4FF33]/90 mt-0.5">
                       {lastTimeSummary}
                     </p>
@@ -838,7 +893,7 @@ export const ActiveWorkoutSession: React.FC<ActiveWorkoutSessionProps> = ({
                               RPE ant: {overloadHint.avgRpe.toFixed(1)}
                             </span>
                             <span className="rounded-md bg-[#0E1014]/80 px-2 py-0.5 text-zinc-200 border border-white/10">
-                              Recup: {overloadHint.recoveryPct}%
+                              Recup: {overloadHint.recoveryScore}%
                             </span>
                             {recoveryIndex.bpm && (
                               <span className="rounded-md bg-[#0E1014]/80 px-2 py-0.5 text-zinc-200 border border-white/10">
@@ -857,18 +912,16 @@ export const ActiveWorkoutSession: React.FC<ActiveWorkoutSessionProps> = ({
                             {overloadHint.deltaWeightKg > 0 && (
                               <button
                                 type="button"
-                                onClick={() =>
+                                onClick={() => {
+                                  const deltaLabel = `+${formatWeight(overloadHint.deltaWeightKg, weightUnit)}`;
                                   onApplyProgressiveOverload(exIdx, {
                                     deltaWeightKg: overloadHint.deltaWeightKg,
-                                    feedbackLabel:
-                                      weightUnit === 'lb'
-                                        ? '+5 lb aplicado'
-                                        : '+2.5 kg aplicado',
-                                  })
-                                }
+                                    feedbackLabel: `${deltaLabel} aplicado`,
+                                  });
+                                }}
                                 className="min-h-[32px] rounded-xl bg-emerald-400 text-[#0A0B0D] px-3 text-[11px] font-extrabold active:scale-95"
                               >
-                                {weightUnit === 'lb' ? '+5 lb' : '+2.5 kg'}
+                                +{formatWeight(overloadHint.deltaWeightKg, weightUnit)}
                               </button>
                             )}
                             {overloadHint.nextBandLevelIds &&
@@ -887,49 +940,83 @@ export const ActiveWorkoutSession: React.FC<ActiveWorkoutSessionProps> = ({
                                   Subir a {overloadHint.nextBandLabel}
                                 </button>
                               )}
-                            <button
-                              type="button"
-                              onClick={() =>
-                                onApplyProgressiveOverload(exIdx, {
-                                  deltaReps: overloadHint.deltaReps || 2,
-                                  feedbackLabel: `+${overloadHint.deltaReps || 2} reps aplicado`,
-                                })
-                              }
-                              className="min-h-[32px] rounded-xl border border-emerald-400/50 bg-[#0E1014] text-emerald-200 hover:bg-emerald-400/15 px-3 text-[11px] font-extrabold active:scale-95"
-                            >
-                              +{overloadHint.deltaReps || 2} reps
-                            </button>
-                            <button
-                              type="button"
-                              onClick={() =>
-                                onApplyProgressiveOverload(exIdx, {
-                                  deltaSets: overloadHint.deltaSets || 1,
-                                  feedbackLabel: '+1 serie añadida',
-                                })
-                              }
-                              className="min-h-[32px] rounded-xl border border-emerald-400/50 bg-[#0E1014] text-emerald-200 hover:bg-emerald-400/15 px-3 text-[11px] font-extrabold active:scale-95"
-                            >
-                              +1 serie
-                            </button>
+                            {overloadHint.deltaDurationSec > 0 ? (
+                              <button
+                                type="button"
+                                onClick={() =>
+                                  onApplyProgressiveOverload(exIdx, {
+                                    deltaReps: overloadHint.deltaDurationSec,
+                                    feedbackLabel: `+${overloadHint.deltaDurationSec}s aplicado`,
+                                  })
+                                }
+                                className="min-h-[32px] rounded-xl bg-emerald-400 text-[#0A0B0D] px-3 text-[11px] font-extrabold active:scale-95"
+                              >
+                                +{overloadHint.deltaDurationSec}s isométricos
+                              </button>
+                            ) : (
+                              overloadHint.deltaReps > 0 && (
+                                <button
+                                  type="button"
+                                  onClick={() =>
+                                    onApplyProgressiveOverload(exIdx, {
+                                      deltaReps: overloadHint.deltaReps,
+                                      feedbackLabel: `+${overloadHint.deltaReps} reps aplicado`,
+                                    })
+                                  }
+                                  className={`min-h-[32px] rounded-xl px-3 text-[11px] font-extrabold active:scale-95 ${
+                                    overloadHint.deltaWeightKg > 0
+                                      ? 'border border-emerald-400/50 bg-[#0E1014] text-emerald-200 hover:bg-emerald-400/15'
+                                      : 'bg-emerald-400 text-[#0A0B0D]'
+                                  }`}
+                                >
+                                  +{overloadHint.deltaReps} reps
+                                </button>
+                              )
+                            )}
                           </div>
                         )}
 
                         {overloadHint.status === 'deload' && (
                           <div className="flex flex-wrap items-center gap-2 pt-0.5">
-                            <button
-                              type="button"
-                              onClick={() =>
-                                onApplyProgressiveOverload(exIdx, {
-                                  deloadFactor:
-                                    overloadHint.deloadFactor ?? 0.9,
-                                  feedbackLabel:
-                                    'Descarga ligera (-10%) aplicada',
-                                })
-                              }
-                              className="min-h-[32px] rounded-xl bg-rose-400 text-[#0A0B0D] px-3 text-[11px] font-extrabold active:scale-95"
-                            >
-                              Aplicar descarga -10%
-                            </button>
+                            {overloadHint.action === 'reduce_volume' ? (
+                              <button
+                                type="button"
+                                onClick={() =>
+                                  onApplyProgressiveOverload(exIdx, {
+                                    deloadFactor:
+                                      overloadHint.deloadFactor ?? 0.85,
+                                    deltaSets: -1,
+                                    feedbackLabel:
+                                      'Volumen reducido (-1 serie / -15%)',
+                                  })
+                                }
+                                className="min-h-[32px] rounded-xl bg-rose-400 text-[#0A0B0D] px-3 text-[11px] font-extrabold active:scale-95"
+                              >
+                                Reducir 1 serie (-15% vol.)
+                              </button>
+                            ) : (
+                              <button
+                                type="button"
+                                onClick={() => {
+                                  const targetText =
+                                    overloadHint.recommendedWeightKg !==
+                                    undefined
+                                      ? formatWeight(
+                                          overloadHint.recommendedWeightKg,
+                                          weightUnit,
+                                        )
+                                      : '-10%';
+                                  onApplyProgressiveOverload(exIdx, {
+                                    deloadFactor:
+                                      overloadHint.deloadFactor ?? 0.9,
+                                    feedbackLabel: `Descarga -10% (${targetText}) aplicada`,
+                                  });
+                                }}
+                                className="min-h-[32px] rounded-xl bg-rose-400 text-[#0A0B0D] px-3 text-[11px] font-extrabold active:scale-95"
+                              >
+                                Aplicar descarga -10%
+                              </button>
+                            )}
                           </div>
                         )}
 
@@ -1188,6 +1275,7 @@ export const ActiveWorkoutSession: React.FC<ActiveWorkoutSessionProps> = ({
                 {/* Sets */}
                 <div className="space-y-3">
                   {ex.sets.map((s, sIdx) => {
+                    const liveSet = liveEx.sets[sIdx] ?? s;
                     const prevSet =
                       previousLog?.sets[sIdx] ??
                       previousLog?.sets[previousLog.sets.length - 1];
@@ -1204,7 +1292,9 @@ export const ActiveWorkoutSession: React.FC<ActiveWorkoutSessionProps> = ({
                         key={s.id}
                         className={`rounded-2xl p-3.5 transition-colors border space-y-3 ${
                           s.completed
-                            ? 'border-[#D4FF33]/55 bg-[#D4FF33]/10'
+                            ? liveSet.isPR
+                              ? 'border-amber-400/65 bg-gradient-to-br from-amber-500/10 via-[#D4FF33]/10 to-[#181B23]'
+                              : 'border-[#D4FF33]/55 bg-[#D4FF33]/10'
                             : currentSetType === 'warmup'
                               ? 'border-amber-500/35 bg-amber-950/15'
                               : 'border-[#222631] bg-[#181B23]'
@@ -1232,6 +1322,22 @@ export const ActiveWorkoutSession: React.FC<ActiveWorkoutSessionProps> = ({
                                     ? ' (F · Fallo)'
                                     : ''}
                             </span>
+                            {liveSet.isPR && (
+                              <span
+                                title={
+                                  liveSet.prLabels?.join(' · ') ||
+                                  'Récord Personal'
+                                }
+                                className="inline-flex items-center gap-1 rounded-full border border-amber-400/60 bg-gradient-to-r from-amber-400/25 via-[#D4FF33]/25 to-amber-400/20 px-2 py-0.5 text-[10px] font-extrabold uppercase tracking-wider text-amber-200"
+                              >
+                                <Trophy className="w-3 h-3 text-[#D4FF33]" />
+                                PR
+                                {liveSet.prLabels &&
+                                liveSet.prLabels.length > 0
+                                  ? ` · ${liveSet.prLabels.join(' · ')}`
+                                  : ''}
+                              </span>
+                            )}
                             <span className="text-xs font-mono tabular-nums text-zinc-400">
                               {prevSet
                                 ? prevSet.bandLabel
@@ -1654,7 +1760,12 @@ export const ActiveWorkoutSession: React.FC<ActiveWorkoutSessionProps> = ({
         <button
           type="button"
           disabled={completedSetsCount === 0}
-          onClick={() => onCompleteWorkout(activeWorkout)}
+          onClick={() =>
+            onCompleteWorkout({
+              ...activeWorkout,
+              exercises: livePrWorkout.exercises,
+            })
+          }
           className="w-full min-h-[56px] flex items-center justify-center gap-2 rounded-2xl bg-[#D4FF33] disabled:bg-[#232730] disabled:text-zinc-500 text-base font-extrabold text-[#0A0B0D] active:scale-[0.98] transition-transform"
         >
           <Check className="w-5 h-5" />

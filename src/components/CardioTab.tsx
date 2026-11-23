@@ -21,6 +21,7 @@ import {
   Square,
   Target,
   Timer,
+  Trophy,
   Volume2,
   VolumeX,
   X,
@@ -37,6 +38,7 @@ import {
   ACTIVITY_OPTIONS,
   buildKilometerVoiceCue,
   buildTimedVoiceCue,
+  classifyGpsSignalQuality,
   computeAvgSpeedKmh,
   estimateCardioCalories,
   estimateCardioSteps,
@@ -44,6 +46,7 @@ import {
   formatPaceMinKm,
   getActivityMeta,
   haversineDistanceKm,
+  validateGpsPoint,
 } from '../lib/cardio';
 import {
   LOW_POWER_GPS_INTERVAL_MS,
@@ -60,6 +63,7 @@ import {
   paceSecPerKmToUnit,
 } from '../lib/units';
 import { cancelCoachSpeech, speakCoachCue } from '../lib/voiceCoach';
+import { evaluateCardioPR } from '../lib/progressiveOverload';
 import { useHardwareManager } from '../hooks/useHardwareManager';
 import type {
   CardioActivityType,
@@ -85,11 +89,6 @@ interface CardioTabProps {
 }
 
 type TrackingPhase = 'idle' | 'running' | 'paused';
-
-interface WakeLockSentinelLike {
-  release: () => Promise<void>;
-  released?: boolean;
-}
 
 export const CardioTab: React.FC<CardioTabProps> = ({
   profile,
@@ -175,7 +174,6 @@ export const CardioTab: React.FC<CardioTabProps> = ({
   const lastCueTimestampRef = useRef(0);
   const lastTimedBlockRef = useRef(0);
   const watchIdRef = useRef<number | null>(null);
-  const wakeLockRef = useRef<WakeLockSentinelLike | null>(null);
   const hrHandleRef = useRef<HeartRateDeviceHandle | null>(null);
 
   // Smart auto-pause & target goal refs
@@ -302,20 +300,12 @@ export const CardioTab: React.FC<CardioTabProps> = ({
 
   // Acquire / release screen Wake Lock via global Hardware Manager
   const acquireWakeLock = async () => {
-    const ok = await hardwareRef.current.acquireWakeLock('cardio');
+    const ok = await hardwareRef.current.acquireWakeLock('gps-cardio');
     setWakeLockActive(ok);
   };
 
   const releaseWakeLock = async () => {
-    await hardwareRef.current.releaseWakeLock('cardio');
-    if (wakeLockRef.current) {
-      try {
-        await wakeLockRef.current.release();
-      } catch {
-        // Ignore release errors
-      }
-      wakeLockRef.current = null;
-    }
+    await hardwareRef.current.releaseWakeLock('gps-cardio');
     setWakeLockActive(false);
   };
 
@@ -360,14 +350,15 @@ export const CardioTab: React.FC<CardioTabProps> = ({
     setGpsStatus('searching');
     navigator.geolocation.getCurrentPosition(
       (pos) => {
+        const initialAccuracy = Math.round(pos.coords.accuracy);
         setPreviewCenter({
           lat: pos.coords.latitude,
           lng: pos.coords.longitude,
           timestamp: pos.timestamp || Date.now(),
-          accuracyM: Math.round(pos.coords.accuracy),
+          accuracyM: initialAccuracy,
         });
-        setGpsAccuracyM(Math.round(pos.coords.accuracy));
-        setGpsStatus('locked');
+        setGpsAccuracyM(initialAccuracy);
+        setGpsStatus(initialAccuracy <= 25 ? 'locked' : 'searching');
         setGpsError(null);
       },
       () => {
@@ -564,14 +555,15 @@ export const CardioTab: React.FC<CardioTabProps> = ({
         };
 
         setPreviewCenter(nextPt);
-        setGpsStatus('locked');
+        setGpsStatus(accuracy <= 25 ? 'locked' : 'searching');
         setGpsError(null);
 
         if (phaseRef.current !== 'running') return;
 
         if (pts.length === 0) {
-          // Require a solid <= 25m GPS lock before anchoring start point (fallback 45m if slow indoors)
-          if (accuracy <= 25) {
+          // Initial anchor point: accept if coords.accuracy <= 50m
+          const initialValidation = validateGpsPoint(nextPt, null);
+          if (initialValidation.accepted) {
             lastGpsSampleMsRef.current = nowSampleMs;
             routePointsRef.current = [nextPt];
             setRoutePoints([nextPt]);
@@ -583,23 +575,32 @@ export const CardioTab: React.FC<CardioTabProps> = ({
 
         lastGpsSampleMsRef.current = nowSampleMs;
 
-        // Strict precision filter: discard coordinates with accuracy > 25 meters
-        if (accuracy > 25) return;
+        const lastPt = pts[pts.length - 1];
+        const validation = validateGpsPoint(nextPt, lastPt);
+        if (!validation.accepted) {
+          return;
+        }
 
-        const speedMps = typeof pos.coords.speed === 'number' ? pos.coords.speed : null;
+        const speedMps =
+          typeof pos.coords.speed === 'number' ? pos.coords.speed : null;
 
         // If smart auto-paused, check whether user started moving again
         if (isAutoPausedRef.current) {
-          const anchor = pauseAnchorPtRef.current ?? pts[pts.length - 1];
+          const anchor = pauseAnchorPtRef.current ?? lastPt;
           const movedFromAnchorKm = haversineDistanceKm(anchor, nextPt);
-          const hasMovingSpeed = speedMps !== null && speedMps >= 0.6;
+          const hasMovingSpeed =
+            (speedMps !== null && speedMps >= 0.6) ||
+            validation.speedMps >= 0.6;
           if (hasMovingSpeed || movedFromAnchorKm >= 0.008) {
             isAutoPausedRef.current = false;
             setIsAutoPaused(false);
             segmentStartMsRef.current = Date.now();
             lastMovementMsRef.current = Date.now();
             pauseAnchorPtRef.current = null;
-            if (voiceEnabled && Date.now() - lastCueTimestampRef.current > 8000) {
+            if (
+              voiceEnabled &&
+              Date.now() - lastCueTimestampRef.current > 8000
+            ) {
               triggerCue('Movimiento detectado, reanudando.');
             }
           } else {
@@ -607,17 +608,7 @@ export const CardioTab: React.FC<CardioTabProps> = ({
           }
         }
 
-        const lastPt = pts[pts.length - 1];
-        const segKm = haversineDistanceKm(lastPt, nextPt);
-        const dtSec = Math.max(0.5, (nextPt.timestamp - lastPt.timestamp) / 1000);
-
-        if (speedMps !== null && speedMps >= 0.55) {
-          lastMovementMsRef.current = Date.now();
-        }
-
-        // Ignore micro-jitter (< 3 meters = 0.003 km) so stationary drift does not add phantom distance
-        if (segKm < 0.003) return;
-        if (segKm > 0.35 && dtSec < 2) return;
+        const segKm = validation.distanceKm;
 
         lastMovementMsRef.current = Date.now();
         pauseAnchorPtRef.current = nextPt;
@@ -809,7 +800,7 @@ export const CardioTab: React.FC<CardioTabProps> = ({
     );
 
     const completedIso = new Date(nowMs).toISOString();
-    const session: CardioSession = {
+    const baseSession: CardioSession = {
       id: `cardio_${nowMs}_${Math.random().toString(36).slice(2, 6)}`,
       date: getTodayIsoDate(),
       activityType,
@@ -831,6 +822,12 @@ export const CardioTab: React.FC<CardioTabProps> = ({
       shoeName: activeShoe
         ? `${activeShoe.brand ? `${activeShoe.brand} ` : ''}${activeShoe.name}`
         : null,
+    };
+
+    const cardioPr = evaluateCardioPR(baseSession, cardioSessions);
+    const session: CardioSession = {
+      ...baseSession,
+      ...(cardioPr.isPR ? { isPR: true, prLabels: cardioPr.prLabels } : {}),
     };
 
     stopGpsWatch();
@@ -927,6 +924,18 @@ export const CardioTab: React.FC<CardioTabProps> = ({
                 <h3 className="mt-0.5 text-2xl sm:text-3xl font-extrabold font-display tracking-tight text-white">
                   Ruta completada
                 </h3>
+                {lastCompletedCardio.isPR && (
+                  <div className="mt-2 inline-flex items-center gap-1.5 rounded-full border border-amber-400/60 bg-gradient-to-r from-amber-400/20 via-[#D4FF33]/20 to-amber-400/15 px-3 py-1 text-xs font-extrabold text-amber-200">
+                    <Trophy className="w-3.5 h-3.5 text-[#D4FF33]" />
+                    <span>
+                      PR
+                      {lastCompletedCardio.prLabels &&
+                      lastCompletedCardio.prLabels.length > 0
+                        ? ` · ${lastCompletedCardio.prLabels.join(' · ')}`
+                        : ''}
+                    </span>
+                  </div>
+                )}
               </div>
               <button
                 type="button"
@@ -1293,28 +1302,40 @@ export const CardioTab: React.FC<CardioTabProps> = ({
         {/* GPS & WakeLock & Auto-Pause Bar */}
         <div className="flex flex-wrap items-center justify-between gap-2 text-xs">
           <div className="flex flex-wrap items-center gap-2">
-            <span
-              className={`inline-flex items-center gap-1.5 rounded-lg px-2.5 py-1 font-bold ${
-                gpsStatus === 'locked'
+            {(() => {
+              if (gpsStatus === 'indoor') {
+                return (
+                  <span className="inline-flex items-center gap-1.5 rounded-lg px-2.5 py-1 font-bold bg-sky-500/15 text-sky-300 border border-sky-500/30">
+                    <Navigation className="w-3.5 h-3.5" />
+                    Modo interior (Caminadora sin GPS)
+                  </span>
+                );
+              }
+              if (gpsStatus === 'error') {
+                return (
+                  <span className="inline-flex items-center gap-1.5 rounded-lg px-2.5 py-1 font-bold bg-rose-500/15 text-rose-300 border border-rose-500/30">
+                    <Navigation className="w-3.5 h-3.5" />
+                    GPS no disponible
+                  </span>
+                );
+              }
+              const signal = classifyGpsSignalQuality(gpsAccuracyM);
+              const badgeClasses =
+                signal.quality === 'optima'
                   ? 'bg-emerald-500/15 text-emerald-300 border border-emerald-500/30'
-                  : gpsStatus === 'indoor'
-                    ? 'bg-sky-500/15 text-sky-300 border border-sky-500/30'
-                    : gpsStatus === 'error'
-                      ? 'bg-rose-500/15 text-rose-300 border border-rose-500/30'
-                      : 'bg-amber-500/15 text-amber-300 border border-amber-500/30'
-              }`}
-            >
-              <Navigation className="w-3.5 h-3.5" />
-              {gpsStatus === 'locked'
-                ? `GPS conectado${gpsAccuracyM ? ` (±${gpsAccuracyM} m)` : ''}`
-                : gpsStatus === 'searching'
-                  ? 'Buscando señal GPS...'
-                  : gpsStatus === 'indoor'
-                    ? 'Modo interior (Caminadora sin GPS)'
-                    : gpsStatus === 'error'
-                      ? 'GPS no disponible'
-                      : 'GPS listo'}
-            </span>
+                  : signal.quality === 'aceptable'
+                    ? 'bg-[#D4FF33]/15 text-[#D4FF33] border border-[#D4FF33]/35'
+                    : 'bg-amber-500/15 text-amber-300 border border-amber-500/30';
+              return (
+                <span
+                  className={`inline-flex items-center gap-1.5 rounded-lg px-2.5 py-1 font-bold ${badgeClasses}`}
+                >
+                  <Navigation className="w-3.5 h-3.5" />
+                  Señal GPS: {signal.label}
+                  {gpsAccuracyM !== null ? ` (±${gpsAccuracyM} m)` : ''}
+                </span>
+              );
+            })()}
 
             {isAutoPaused && (
               <span className="inline-flex items-center gap-1.5 rounded-lg bg-amber-500/20 border border-amber-400/40 px-2.5 py-1 font-extrabold text-amber-200">
@@ -1903,6 +1924,20 @@ export const CardioTab: React.FC<CardioTabProps> = ({
                         <span className="text-xs font-bold text-[#D4FF33]">
                           {meta.label}
                         </span>
+                        {session.isPR && (
+                          <span
+                            title={
+                              session.prLabels?.join(' · ') || 'Récord Personal'
+                            }
+                            className="inline-flex items-center gap-1 rounded-full border border-amber-400/60 bg-gradient-to-r from-amber-400/25 via-[#D4FF33]/25 to-amber-400/20 px-2 py-0.5 text-[10px] font-extrabold uppercase tracking-wider text-amber-200"
+                          >
+                            <Trophy className="w-3 h-3 text-[#D4FF33]" />
+                            PR
+                            {session.prLabels && session.prLabels.length > 0
+                              ? ` · ${session.prLabels.join(' · ')}`
+                              : ''}
+                          </span>
+                        )}
                         <span className="text-xs text-zinc-500">· {dateLabel}</span>
                         {session.targetDistanceKm && session.distanceKm >= session.targetDistanceKm && (
                           <span className="text-[11px] font-bold text-emerald-300">

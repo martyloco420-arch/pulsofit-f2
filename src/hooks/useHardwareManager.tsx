@@ -17,7 +17,13 @@ export type MediaStreamOwner =
   | 'plate_speech'
   | 'custom';
 
-export type WakeLockReason = 'cardio' | 'sleep' | 'workout';
+export type WakeLockKey =
+  | 'ppg-scanner'
+  | 'hiit-timer'
+  | 'active-workout'
+  | 'gps-cardio';
+
+export type WakeLockReason = WakeLockKey | 'cardio' | 'sleep' | 'workout';
 export type AudioFocusKind = 'tts' | 'sleep_aid';
 
 interface WakeLockSentinelLike {
@@ -57,8 +63,8 @@ interface HardwareManagerContextValue {
   stopBleScan: () => void;
   registerGpsWatch: (watchId: number) => void;
   clearGpsWatch: () => void;
-  acquireWakeLock: (reason: WakeLockReason) => Promise<boolean>;
-  releaseWakeLock: (reason?: WakeLockReason) => Promise<void>;
+  acquireWakeLock: (key: WakeLockReason) => Promise<boolean>;
+  releaseWakeLock: (key?: WakeLockReason) => Promise<void>;
   notifyTabChange: (nextTab: TabId) => void;
   requestAudioFocus: (kind: AudioFocusKind) => void;
   releaseAudioFocus: (kind: AudioFocusKind) => void;
@@ -206,7 +212,8 @@ export const HardwareManagerProvider: React.FC<{ children: React.ReactNode }> = 
   const bleStopRef = useRef<(() => void) | null>(null);
   const gpsWatchIdRef = useRef<number | null>(null);
   const wakeLockRef = useRef<WakeLockSentinelLike | null>(null);
-  const wakeReasonsRef = useRef<Set<WakeLockReason>>(new Set());
+  const wakeKeysRef = useRef<Set<WakeLockReason>>(new Set());
+  const lastNotifiedTabRef = useRef<TabId | null>(null);
   const [wakeLockActive, setWakeLockActive] = useState(false);
   const [bleScanActive, setBleScanActive] = useState(false);
   const [activeStreamOwners, setActiveStreamOwners] = useState<MediaStreamOwner[]>(
@@ -319,7 +326,7 @@ export const HardwareManagerProvider: React.FC<{ children: React.ReactNode }> = 
     const sentinel = wakeLockRef.current;
     wakeLockRef.current = null;
     setWakeLockActive(false);
-    if (sentinel) {
+    if (sentinel && !sentinel.released) {
       try {
         await sentinel.release();
       } catch {
@@ -329,7 +336,10 @@ export const HardwareManagerProvider: React.FC<{ children: React.ReactNode }> = 
   }, []);
 
   const requestWakeLockSentinel = useCallback(async (): Promise<boolean> => {
-    if (typeof navigator === 'undefined') return false;
+    if (typeof navigator === 'undefined' || !('wakeLock' in navigator)) {
+      setWakeLockActive(false);
+      return false;
+    }
     const nav = navigator as unknown as {
       wakeLock?: { request: (type: 'screen') => Promise<WakeLockSentinelLike> };
     };
@@ -341,12 +351,25 @@ export const HardwareManagerProvider: React.FC<{ children: React.ReactNode }> = 
       setWakeLockActive(false);
       return false;
     }
+    if (wakeKeysRef.current.size === 0) {
+      setWakeLockActive(false);
+      return false;
+    }
     if (wakeLockRef.current && !wakeLockRef.current.released) {
       setWakeLockActive(true);
       return true;
     }
     try {
       const sentinel = await nav.wakeLock.request('screen');
+      if (
+        wakeKeysRef.current.size === 0 ||
+        (typeof document !== 'undefined' && document.visibilityState === 'hidden')
+      ) {
+        wakeLockRef.current = null;
+        setWakeLockActive(false);
+        void sentinel.release().catch(() => {});
+        return false;
+      }
       wakeLockRef.current = sentinel;
       setWakeLockActive(true);
       sentinel.addEventListener?.('release', () => {
@@ -363,22 +386,22 @@ export const HardwareManagerProvider: React.FC<{ children: React.ReactNode }> = 
   }, []);
 
   const acquireWakeLock = useCallback(
-    async (reason: WakeLockReason): Promise<boolean> => {
-      wakeReasonsRef.current.add(reason);
+    async (key: WakeLockReason): Promise<boolean> => {
+      wakeKeysRef.current.add(key);
       return requestWakeLockSentinel();
     },
     [requestWakeLockSentinel],
   );
 
   const releaseWakeLock = useCallback(
-    async (reason?: WakeLockReason) => {
-      if (reason) {
-        wakeReasonsRef.current.delete(reason);
+    async (key?: WakeLockReason) => {
+      if (key) {
+        wakeKeysRef.current.delete(key);
       } else {
-        wakeReasonsRef.current.clear();
+        wakeKeysRef.current.clear();
       }
 
-      if (wakeReasonsRef.current.size === 0) {
+      if (wakeKeysRef.current.size === 0) {
         await releaseWakeLockSentinelOnly();
       }
     },
@@ -387,16 +410,28 @@ export const HardwareManagerProvider: React.FC<{ children: React.ReactNode }> = 
 
   const notifyTabChange = useCallback(
     (nextTab: TabId) => {
+      if (lastNotifiedTabRef.current === nextTab) {
+        return;
+      }
+      const prevTab = lastNotifiedTabRef.current;
+      lastNotifiedTabRef.current = nextTab;
+      if (prevTab === null) {
+        return;
+      }
+
       // Immediately disable torch + stop any active camera/mic tracks & active BLE scans on tab change
       releaseAllMediaStreams();
       stopBleScan();
-      // Keep WakeLock only if a background cardio or sleep session is actively running
-      const hasPersistentBackgroundSession =
-        wakeReasonsRef.current.has('cardio') || wakeReasonsRef.current.has('sleep');
-      if (nextTab !== 'entrenar') {
-        wakeReasonsRef.current.delete('workout');
+
+      if (nextTab !== 'salud') {
+        wakeKeysRef.current.delete('ppg-scanner');
       }
-      if (!hasPersistentBackgroundSession) {
+      if (nextTab !== 'entrenar') {
+        wakeKeysRef.current.delete('workout');
+        wakeKeysRef.current.delete('active-workout');
+        wakeKeysRef.current.delete('hiit-timer');
+      }
+      if (wakeKeysRef.current.size === 0) {
         void releaseWakeLockSentinelOnly();
       }
     },
@@ -418,8 +453,8 @@ export const HardwareManagerProvider: React.FC<{ children: React.ReactNode }> = 
   }, []);
 
   // Global visibilitychange / pagehide lifecycle:
-  // - hidden / pagehide -> send { torch: false }, stop all camera/mic streams, stop BLE scan & release WakeLock
-  // - visible -> re-acquire WakeLock automatically if cardio or sleep monitoring is active
+  // - hidden / pagehide -> send { torch: false }, stop all camera/mic streams, stop BLE scan & clear WakeLock sentinel reference
+  // - visible -> re-acquire navigator.wakeLock.request('screen') automatically if active WakeLock keys Set has size > 0
   useEffect(() => {
     if (typeof document === 'undefined') return undefined;
 
@@ -429,10 +464,7 @@ export const HardwareManagerProvider: React.FC<{ children: React.ReactNode }> = 
         stopBleScan();
         void releaseWakeLockSentinelOnly();
       } else if (document.visibilityState === 'visible') {
-        const shouldRestoreWakeLock =
-          wakeReasonsRef.current.has('cardio') ||
-          wakeReasonsRef.current.has('sleep');
-        if (shouldRestoreWakeLock) {
+        if (wakeKeysRef.current.size > 0) {
           void requestWakeLockSentinel();
         }
       }

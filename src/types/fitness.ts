@@ -74,6 +74,8 @@ export interface UserProfile {
   dailyActiveMinGoal?: number;
   dailyActiveKcalGoal?: number;
   rpeTrackingEnabled?: boolean;
+  customGoal?: string;
+  onboardingCompleted?: boolean;
 }
 
 export interface ExerciseDefinition {
@@ -95,10 +97,13 @@ export interface WorkoutSet {
   id: string;
   weightKg: number;
   reps: number;
+  durationSec?: number;
   rpe?: number; // 1 to 10
   setType?: SetType;
   completed: boolean;
   bandLabel?: string;
+  isPR?: boolean;
+  prLabels?: string[];
 }
 
 export interface BandConfig {
@@ -206,6 +211,8 @@ export interface WorkoutSession {
   completedSets: number;
   exercises: WorkoutExercise[];
   fatigueImpact: Partial<Record<MuscleGroup, number>>;
+  isPR?: boolean;
+  prLabels?: string[];
 }
 
 export interface BodyWeightEntry {
@@ -416,6 +423,8 @@ export interface CardioSession {
   splits: CardioSplit[];
   shoeId?: string | null;
   shoeName?: string | null;
+  isPR?: boolean;
+  prLabels?: string[];
 }
 
 export interface ManualDailyActivity {

@@ -50,6 +50,9 @@ export function normalizeWorkoutSession(
               id: safeStr(s?.id, `set_${Math.random().toString(36).slice(2, 7)}`),
               reps: Math.max(0, Math.round(safeNum(s?.reps, 0))),
               weightKg: Math.max(0, safeNum(s?.weightKg, 0)),
+              ...(typeof s?.durationSec === 'number' && Number.isFinite(s.durationSec)
+                ? { durationSec: Math.max(0, Math.round(s.durationSec)) }
+                : {}),
               rpe:
                 typeof s?.rpe === 'number' && Number.isFinite(s.rpe)
                   ? s.rpe
@@ -58,6 +61,14 @@ export function normalizeWorkoutSession(
               completed: Boolean(s?.completed),
               bandLabel:
                 typeof s?.bandLabel === 'string' ? s.bandLabel : undefined,
+              ...(s?.isPR ? { isPR: true } : {}),
+              ...(Array.isArray(s?.prLabels) && s.prLabels.length > 0
+                ? {
+                    prLabels: s.prLabels.filter(
+                      (lbl): lbl is string => typeof lbl === 'string',
+                    ),
+                  }
+                : {}),
             }))
           : [],
         notes: typeof ex?.notes === 'string' ? ex.notes : undefined,
@@ -77,6 +88,14 @@ export function normalizeWorkoutSession(
       raw.fatigueImpact && typeof raw.fatigueImpact === 'object'
         ? raw.fatigueImpact
         : {},
+    ...(raw.isPR ? { isPR: true } : {}),
+    ...(Array.isArray(raw.prLabels) && raw.prLabels.length > 0
+      ? {
+          prLabels: raw.prLabels.filter(
+            (lbl): lbl is string => typeof lbl === 'string',
+          ),
+        }
+      : {}),
   };
 }
 
@@ -135,6 +154,14 @@ export function normalizeCardioSession(
     splits,
     shoeId: typeof raw.shoeId === 'string' && raw.shoeId ? raw.shoeId : null,
     shoeName: typeof raw.shoeName === 'string' && raw.shoeName ? raw.shoeName : null,
+    ...(raw.isPR ? { isPR: true } : {}),
+    ...(Array.isArray(raw.prLabels) && raw.prLabels.length > 0
+      ? {
+          prLabels: raw.prLabels.filter(
+            (lbl): lbl is string => typeof lbl === 'string',
+          ),
+        }
+      : {}),
   };
 }
 

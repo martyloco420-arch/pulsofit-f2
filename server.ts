@@ -51,6 +51,7 @@ const MUSCLE_ENUM = [
 ];
 
 interface PushPreferences {
+  smartRemindersEnabled: boolean;
   waterEnabled: boolean;
   waterIntervalMin: number;
   waterStartTime: string;
@@ -72,6 +73,7 @@ interface SerializedPushSubscription {
 
 interface StoredPushSubscription {
   id: string;
+  profileId: string;
   endpoint: string;
   subscription: SerializedPushSubscription;
   preferences: PushPreferences;
@@ -95,6 +97,7 @@ const PUSH_DATA_DIR = path.resolve(__dirname, 'data');
 const PUSH_STORE_FILE = path.join(PUSH_DATA_DIR, 'push-store.json');
 
 const DEFAULT_PUSH_PREFERENCES: PushPreferences = {
+  smartRemindersEnabled: false,
   waterEnabled: false,
   waterIntervalMin: 90,
   waterStartTime: '08:00',
@@ -131,6 +134,12 @@ function sanitizeTimeZone(raw: unknown): string | undefined {
   }
 }
 
+function sanitizeProfileId(raw: unknown): string {
+  if (typeof raw !== 'string') return 'main';
+  const cleaned = raw.trim().slice(0, 64);
+  return cleaned || 'main';
+}
+
 function sanitizePushPreferences(raw: unknown): PushPreferences {
   const obj = raw && typeof raw === 'object' ? (raw as Record<string, unknown>) : {};
   const intervalRaw = Number(obj.waterIntervalMin);
@@ -145,8 +154,16 @@ function sanitizePushPreferences(raw: unknown): PushPreferences {
     : DEFAULT_PUSH_PREFERENCES.workoutDays;
   const workoutDays = Array.from(new Set(daysRaw)).sort((a, b) => a - b);
 
+  const smartRemindersEnabled =
+    typeof obj.smartRemindersEnabled === 'boolean'
+      ? obj.smartRemindersEnabled
+      : Boolean(obj.waterEnabled);
+  const waterEnabled =
+    typeof obj.waterEnabled === 'boolean' ? obj.waterEnabled : smartRemindersEnabled;
+
   return {
-    waterEnabled: Boolean(obj.waterEnabled),
+    smartRemindersEnabled,
+    waterEnabled,
     waterIntervalMin,
     waterStartTime: sanitizeTimeHHMM(obj.waterStartTime, DEFAULT_PUSH_PREFERENCES.waterStartTime),
     waterEndTime: sanitizeTimeHHMM(obj.waterEndTime, DEFAULT_PUSH_PREFERENCES.waterEndTime),
@@ -310,10 +327,16 @@ function loadPushStore(): PushStoreData {
         : webpush.generateVAPIDKeys();
 
   const subscriptions = Array.isArray(parsed?.subscriptions)
-    ? parsed!.subscriptions.filter(
-        (item): item is StoredPushSubscription =>
-          Boolean(item && typeof item.endpoint === 'string' && item.subscription?.keys?.p256dh),
-      )
+    ? parsed!.subscriptions
+        .filter(
+          (item): item is StoredPushSubscription =>
+            Boolean(item && typeof item.endpoint === 'string' && item.subscription?.keys?.p256dh),
+        )
+        .map((item) => ({
+          ...item,
+          profileId: sanitizeProfileId((item as Partial<StoredPushSubscription>).profileId),
+          preferences: sanitizePushPreferences(item.preferences),
+        }))
     : [];
 
   const store: PushStoreData = {
@@ -378,13 +401,20 @@ async function startServer() {
   });
 
   app.post('/api/push/subscribe', (req, res) => {
-    const { subscription, preferences, lastWaterTimestamp, lastWorkoutDate } = req.body ?? {};
+    const {
+      subscription,
+      preferences,
+      profileId,
+      lastWaterTimestamp,
+      lastWorkoutDate,
+    } = req.body ?? {};
     const validSub = validatePushSubscription(subscription);
     if (!validSub) {
       res.status(400).json({ error: 'Suscripción Push inválida o incompleta.' });
       return;
     }
 
+    const resolvedProfileId = sanitizeProfileId(profileId);
     const sanitizedPrefs = sanitizePushPreferences(preferences);
     const nowMs = Date.now();
     const nowIso = new Date(nowMs).toISOString();
@@ -405,6 +435,7 @@ async function startServer() {
       const existing = pushStore.subscriptions[idx];
       pushStore.subscriptions[idx] = {
         ...existing,
+        profileId: resolvedProfileId,
         subscription: validSub,
         preferences: sanitizedPrefs,
         lastWaterTimestamp:
@@ -417,6 +448,7 @@ async function startServer() {
     } else {
       pushStore.subscriptions.push({
         id: hashEndpoint(validSub.endpoint),
+        profileId: resolvedProfileId,
         endpoint: validSub.endpoint,
         subscription: validSub,
         preferences: sanitizedPrefs,
@@ -433,20 +465,27 @@ async function startServer() {
     res.json({
       ok: true,
       id: hashEndpoint(validSub.endpoint),
+      profileId: resolvedProfileId,
       preferences: sanitizedPrefs,
     });
   });
 
   app.post('/api/push/unsubscribe', (req, res) => {
     const endpoint = typeof req.body?.endpoint === 'string' ? req.body.endpoint.trim() : '';
-    if (!endpoint) {
-      res.status(400).json({ error: 'Falta el endpoint de suscripción.' });
+    const profileId =
+      typeof req.body?.profileId === 'string' && req.body.profileId.trim()
+        ? sanitizeProfileId(req.body.profileId)
+        : null;
+    if (!endpoint && !profileId) {
+      res.status(400).json({ error: 'Falta el endpoint o profileId de suscripción.' });
       return;
     }
     const before = pushStore.subscriptions.length;
-    pushStore.subscriptions = pushStore.subscriptions.filter(
-      (item) => item.endpoint !== endpoint,
-    );
+    pushStore.subscriptions = pushStore.subscriptions.filter((item) => {
+      if (endpoint && item.endpoint === endpoint) return false;
+      if (!endpoint && profileId && item.profileId === profileId) return false;
+      return true;
+    });
     const removed = before - pushStore.subscriptions.length;
     if (removed > 0) {
       savePushStore(pushStore);
@@ -459,6 +498,10 @@ async function startServer() {
     const endpoint =
       typeof req.body?.endpoint === 'string' && req.body.endpoint.trim()
         ? req.body.endpoint.trim()
+        : null;
+    const profileId =
+      typeof req.body?.profileId === 'string' && req.body.profileId.trim()
+        ? sanitizeProfileId(req.body.profileId)
         : null;
     const nowMs = Date.now();
     const nowIso = new Date(nowMs).toISOString();
@@ -478,8 +521,9 @@ async function startServer() {
       let updated = 0;
       for (const sub of pushStore.subscriptions) {
         if (endpoint && sub.endpoint !== endpoint) continue;
+        if (!endpoint && profileId && sub.profileId !== profileId) continue;
         sub.lastWaterTimestamp = nextWaterTs;
-        sub.lastWorkoutDate = rawWorkoutDate;
+        sub.lastWorkoutDate = rawWorkoutDate ?? null;
         sub.updatedAt = nowIso;
         updated += 1;
       }
@@ -501,6 +545,7 @@ async function startServer() {
     let updated = 0;
     for (const sub of pushStore.subscriptions) {
       if (endpoint && sub.endpoint !== endpoint) continue;
+      if (!endpoint && profileId && sub.profileId !== profileId) continue;
       if (type === 'water') {
         sub.lastWaterTimestamp = nowMs;
       } else {
@@ -525,11 +570,17 @@ async function startServer() {
       typeof req.body?.endpoint === 'string' && req.body.endpoint.trim()
         ? req.body.endpoint.trim()
         : null;
+    const profileId =
+      typeof req.body?.profileId === 'string' && req.body.profileId.trim()
+        ? sanitizeProfileId(req.body.profileId)
+        : null;
     const kind = req.body?.kind === 'workout' ? 'workout' : req.body?.kind === 'water' ? 'water' : 'test';
 
     const targets = endpoint
       ? pushStore.subscriptions.filter((item) => item.endpoint === endpoint)
-      : pushStore.subscriptions;
+      : profileId
+        ? pushStore.subscriptions.filter((item) => item.profileId === profileId)
+        : pushStore.subscriptions;
 
     if (targets.length === 0) {
       res.status(404).json({
@@ -590,9 +641,9 @@ async function startServer() {
         const prefs = sub.preferences;
         const clock = getLocalClockParts(nowMs, prefs.timeZone);
 
-        // 1. Recordatorio de hidratación
+        // 1. Recordatorios inteligentes (hidratación, inactividad o check-in diario)
         if (
-          prefs.waterEnabled &&
+          (prefs.smartRemindersEnabled || prefs.waterEnabled) &&
           isWithinTimeWindow(clock.minutesFromMidnight, prefs.waterStartTime, prefs.waterEndTime)
         ) {
           const minSinceWater = (nowMs - (sub.lastWaterTimestamp || 0)) / 60_000;
@@ -1491,9 +1542,10 @@ async function startServer() {
       const systemInstruction = [
         effectivePersonality === 'sargento' ? sargentoRules : motivadorRules,
         'Reglas de salida obligatorias:',
-        '1. Analiza el estado consolidado de TODAS las pestañas: Dashboard (pasos/min activos/calorías activas), Salud (BPM, HRV, estrés, presión, % grasa/músculo), Entrenar (sesiones recientes y RPE), Nutrición (calorías/proteína), Hidratación (agua % y electrolitos), Sueño (horas y calidad %), Progreso (tendencia peso 7/30d), Perfil (meta y racha/escudo/pausa activa).',
-        '2. Si el usuario escribió un mensaje nuevo (ej. cambio de turno, cansancio, molestia), responde directamente ajustando el plan de hoy.',
-        '3. Sé breve y contundente:',
+        '1. Analiza el estado omnisciente de TODO el perfil: Objetivo actual persistente (context.customGoal y context.goal), equipo disponible (context.equipment), días de descanso programados/Modo Turno, Biometría 7d/30d (peso, delta, cintura, % grasa, presión arterial promedio, BPM y HRV RMSSD), Entrenamientos (fuerza, HIIT, cardio GPS, RPE promedio, récords personales PRs recientes) y Recuperación, Nutrición (calorías y proteína vs meta), Hidratación, Sueño y Racha.',
+        '2. Alinea siempre tu consejo con context.customGoal si el atleta definió uno.',
+        '3. Si el usuario escribió un mensaje nuevo (ej. cambio de turno, cansancio, molestia), responde directamente ajustando el plan de hoy.',
+        '4. Sé breve y contundente:',
         '   - headline: máx 7 palabras.',
         '   - goodBullets: exactamente 2 viñetas cortas de "Qué va bien" basadas en datos reales (máx 11 palabras cada una).',
         '   - weakBullets: exactamente 2 viñetas cortas de "Qué va flojo o pendiente" basadas en datos reales (máx 11 palabras cada una).',
@@ -1560,11 +1612,16 @@ async function startServer() {
     }
   });
 
+  app.use('/api', (_req, res) => {
+    res.status(404).json({ error: 'Ruta API no encontrada' });
+  });
+
   if (!isProduction) {
     const { createServer: createViteServer } = await import('vite');
     const vite = await createViteServer({
       server: {
         middlewareMode: true,
+        allowedHosts: true,
         hmr: false,
         ws: false,
         watch: process.env.DISABLE_HMR === 'true' ? null : undefined,

@@ -13,6 +13,7 @@ import {
   Scale,
   Search,
   Trash2,
+  Trophy,
   Utensils,
 } from 'lucide-react';
 import { DataCleanupConfirmModal } from './DataCleanupConfirmModal';
@@ -70,6 +71,12 @@ interface DetailRow {
   value: string;
 }
 
+interface HistorialSubLine {
+  text: string;
+  isPR?: boolean;
+  prLabels?: string[];
+}
+
 interface HistorialItem {
   id: string;
   category: Exclude<HistorialFilter, 'all'>;
@@ -80,8 +87,10 @@ interface HistorialItem {
   title: string;
   subtitle: string;
   highlightMetric: string;
+  isPR?: boolean;
+  prLabels?: string[];
   details: DetailRow[];
-  subBlocks?: { heading: string; lines: string[] }[];
+  subBlocks?: { heading: string; lines: (string | HistorialSubLine)[] }[];
   onDelete?: () => void;
 }
 
@@ -184,11 +193,20 @@ export const HistorialTab: React.FC<HistorialTabProps> = ({
     // 1. Ejercicios: Workouts (Fuerza / Ligas)
     for (const w of database.workouts) {
       const dateIso = getLocalDateKey(w.completedAt);
+      const prLabelCollector = new Set<string>(w.prLabels ?? []);
+      let hasSetPR = false;
+
       const exerciseBlocks = w.exercises
         .map((ex) => {
           const doneSets = ex.sets.filter((s) => s.completed);
           if (doneSets.length === 0) return null;
-          const lines = doneSets.map((s, idx) => {
+          const lines: HistorialSubLine[] = doneSets.map((s, idx) => {
+            if (s.isPR) {
+              hasSetPR = true;
+              for (const lbl of s.prLabels ?? []) {
+                prLabelCollector.add(`${ex.name}: ${lbl}`);
+              }
+            }
             const load = s.bandLabel
               ? `${s.bandLabel} (${formatWeight(s.weightKg, weightUnit)})`
               : s.weightKg > 0
@@ -197,11 +215,18 @@ export const HistorialTab: React.FC<HistorialTabProps> = ({
             const tag =
               s.setType && s.setType !== 'normal' ? ` [${s.setType}]` : '';
             const rpe = s.rpe ? ` · RPE ${s.rpe}` : '';
-            return `Serie ${idx + 1}: ${load} × ${s.reps} reps${tag}${rpe}`;
+            return {
+              text: `Serie ${idx + 1}: ${load} × ${s.reps} reps${tag}${rpe}`,
+              isPR: s.isPR,
+              prLabels: s.prLabels,
+            };
           });
           return { heading: ex.name, lines };
         })
-        .filter((b): b is { heading: string; lines: string[] } => b !== null);
+        .filter((b): b is { heading: string; lines: HistorialSubLine[] } => b !== null);
+
+      const workoutHasPR = Boolean(w.isPR) || hasSetPR;
+      const workoutPrLabels = Array.from(prLabelCollector);
 
       items.push({
         id: `wk_${w.id}`,
@@ -213,10 +238,15 @@ export const HistorialTab: React.FC<HistorialTabProps> = ({
         title: w.title,
         subtitle: `${w.exercises.length} ejercicios · ${w.completedSets} series completadas`,
         highlightMetric: formatVolume(w.totalVolumeKg, weightUnit),
+        isPR: workoutHasPR || undefined,
+        prLabels: workoutHasPR ? workoutPrLabels : undefined,
         details: [
           { label: 'Duración', value: formatDurationClock(w.durationSec) },
           { label: 'Series totales', value: String(w.completedSets) },
           { label: 'Volumen total', value: formatVolume(w.totalVolumeKg, weightUnit) },
+          ...(workoutHasPR && workoutPrLabels.length > 0
+            ? [{ label: 'Récords (PR)', value: workoutPrLabels.slice(0, 3).join(' · ') }]
+            : []),
         ],
         subBlocks: exerciseBlocks,
         onDelete: () => onDeleteWorkout(w.id),
@@ -272,6 +302,8 @@ export const HistorialTab: React.FC<HistorialTabProps> = ({
         )}`,
         subtitle: `${formatDurationClock(c.durationSec)} activo · Ritmo ${avgPaceFormatted}`,
         highlightMetric: `${c.caloriesBurned} kcal`,
+        isPR: c.isPR || undefined,
+        prLabels: c.prLabels,
         details: [
           { label: 'Distancia', value: formatDistance(c.distanceKm, distanceUnit) },
           { label: 'Tiempo activo', value: formatDurationClock(c.durationSec) },
@@ -285,6 +317,17 @@ export const HistorialTab: React.FC<HistorialTabProps> = ({
             value: (c.estimatedSteps ?? 0).toLocaleString('es-MX'),
           },
           { label: 'Calzado', value: c.shoeName || 'Sin asignar' },
+          ...(c.isPR
+            ? [
+                {
+                  label: 'Récord (PR)',
+                  value:
+                    c.prLabels && c.prLabels.length > 0
+                      ? c.prLabels.join(' · ')
+                      : 'Récord Personal',
+                },
+              ]
+            : []),
         ],
         subBlocks:
           splitsLines.length > 0
@@ -984,10 +1027,19 @@ export const HistorialTab: React.FC<HistorialTabProps> = ({
                             {renderCategoryIcon(item)}
                           </div>
                           <div className="min-w-0">
-                            <div className="flex items-center gap-2 text-[11px] text-zinc-400">
+                            <div className="flex items-center gap-2 flex-wrap text-[11px] text-zinc-400">
                               <span className="font-mono tabular-nums">{item.timeLabel}</span>
                               <span aria-hidden="true">·</span>
                               <span className="font-bold text-emerald-400">{item.badge}</span>
+                              {item.isPR && (
+                                <span
+                                  title={item.prLabels?.join(' · ') || 'Récord Personal'}
+                                  className="inline-flex items-center gap-1 rounded-full border border-amber-400/60 bg-gradient-to-r from-amber-400/25 via-[#D4FF33]/25 to-amber-400/20 px-2 py-0.5 text-[10px] font-extrabold uppercase tracking-wider text-amber-200"
+                                >
+                                  <Trophy className="w-2.5 h-2.5 text-[#D4FF33]" />
+                                  PR
+                                </span>
+                              )}
                             </div>
                             <p className="text-sm sm:text-base font-bold text-white truncate mt-0.5">
                               {item.title}
@@ -1048,15 +1100,37 @@ export const HistorialTab: React.FC<HistorialTabProps> = ({
                                   <p className="text-xs font-bold text-[#D4FF33]">
                                     {block.heading}
                                   </p>
-                                  <ul className="space-y-0.5">
-                                    {block.lines.map((line, lIdx) => (
-                                      <li
-                                        key={lIdx}
-                                        className="text-xs font-mono tabular-nums text-zinc-300"
-                                      >
-                                        {line}
-                                      </li>
-                                    ))}
+                                  <ul className="space-y-1">
+                                    {block.lines.map((line, lIdx) => {
+                                      const lineText =
+                                        typeof line === 'string' ? line : line.text;
+                                      const lineIsPR =
+                                        typeof line !== 'string' && Boolean(line.isPR);
+                                      const linePrLabels =
+                                        typeof line !== 'string' ? line.prLabels : undefined;
+                                      return (
+                                        <li
+                                          key={lIdx}
+                                          className="flex flex-wrap items-center gap-2 text-xs font-mono tabular-nums text-zinc-300"
+                                        >
+                                          <span>{lineText}</span>
+                                          {lineIsPR && (
+                                            <span
+                                              title={
+                                                linePrLabels?.join(' · ') || 'Récord Personal'
+                                              }
+                                              className="inline-flex items-center gap-1 rounded-full border border-amber-400/60 bg-gradient-to-r from-amber-400/25 via-[#D4FF33]/25 to-amber-400/20 px-2 py-0.5 text-[10px] font-sans font-extrabold uppercase tracking-wider text-amber-200"
+                                            >
+                                              <Trophy className="w-2.5 h-2.5 text-[#D4FF33]" />
+                                              PR
+                                              {linePrLabels && linePrLabels.length > 0
+                                                ? ` · ${linePrLabels.join(' · ')}`
+                                                : ''}
+                                            </span>
+                                          )}
+                                        </li>
+                                      );
+                                    })}
                                   </ul>
                                 </div>
                               ))}

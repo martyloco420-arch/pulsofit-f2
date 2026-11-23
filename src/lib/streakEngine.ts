@@ -254,3 +254,198 @@ export function computeFlexibleStreakSummary(
     daysSinceLastWorkout,
   };
 }
+
+export type StreakHeatmapDayStatus = 'trained' | 'rest_or_pause' | 'inactive' | 'future';
+
+export interface StreakHeatmapDayCell {
+  date: string;
+  dayNumber: number;
+  isToday: boolean;
+  isFuture: boolean;
+  status: StreakHeatmapDayStatus;
+  label: string;
+}
+
+export interface StreakAnalytics28d {
+  currentStreakDays: number;
+  bestStreakDays: number;
+  consistencyPct: number;
+  trainedDays28d: number;
+  restOrPauseDays28d: number;
+  elapsedDays28d: number;
+  startIso: string;
+  endSundayIso: string;
+  cells: StreakHeatmapDayCell[];
+}
+
+function collectHardTrainedDatesSet(db: AppDatabase): Set<string> {
+  const set = new Set<string>();
+
+  for (const w of db.workouts ?? []) {
+    if (w.completedAt) set.add(getLocalDateKey(w.completedAt));
+  }
+  for (const c of db.cardioSessions ?? []) {
+    const key = getLocalDateKey(c.date || c.completedAt);
+    if (key) set.add(key);
+  }
+  for (const h of db.hiitSessions ?? []) {
+    const key = getLocalDateKey(h.date || h.completedAt);
+    if (key) set.add(key);
+  }
+  for (const [dateKey, entry] of Object.entries(db.manualActivityByDate ?? {})) {
+    if (!entry) continue;
+    if ((entry.steps ?? 0) >= 4000 || (entry.activeMin ?? 0) >= 20) {
+      set.add(getLocalDateKey(entry.date || dateKey));
+    }
+  }
+
+  return set;
+}
+
+function collectActivePauseDatesSet(db: AppDatabase): Set<string> {
+  const set = new Set<string>();
+  for (const [dateKey, entry] of Object.entries(db.manualActivityByDate ?? {})) {
+    if (!entry) continue;
+    if ((entry.pausaActivaCount ?? 0) >= 1) {
+      set.add(getLocalDateKey(entry.date || dateKey));
+    }
+  }
+  return set;
+}
+
+function computeBestHistoricalStreakDays(
+  trainedSet: Set<string>,
+  todayIso: string,
+): number {
+  const validDates = Array.from(trainedSet)
+    .filter((d) => /^\d{4}-\d{2}-\d{2}$/.test(d) && d <= todayIso)
+    .sort((a, b) => a.localeCompare(b));
+
+  if (validDates.length === 0) return 0;
+
+  const firstDate = validDates[0];
+  const totalSpanDays = Math.max(0, diffDaysLocal(firstDate, todayIso));
+  let best = 0;
+  let runTrainedCount = 0;
+  let restIndices: number[] = [];
+
+  for (let i = 0; i <= totalSpanDays; i += 1) {
+    const dateIso = shiftIsoDate(firstDate, i);
+    if (trainedSet.has(dateIso)) {
+      runTrainedCount += 1;
+      if (runTrainedCount > best) {
+        best = runTrainedCount;
+      }
+      continue;
+    }
+
+    if (runTrainedCount === 0) continue;
+
+    const recentRests = restIndices.filter((r) => i - r <= 6);
+    if (recentRests.length < 2) {
+      restIndices = [...recentRests, i];
+    } else {
+      runTrainedCount = 0;
+      restIndices = [];
+    }
+  }
+
+  return best;
+}
+
+export function computeStreakAnalytics(
+  db: AppDatabase,
+  todayIso = new Date().toLocaleDateString('en-CA'),
+): StreakAnalytics28d {
+  const summary = computeFlexibleStreakSummary(db, todayIso);
+  const fullTrainedSet = collectTrainedDatesSet(db);
+  const hardTrainedSet = collectHardTrainedDatesSet(db);
+  const activePauseSet = collectActivePauseDatesSet(db);
+  const scheduledRestSet = new Set<string>(
+    (db.scheduledRestDates ?? []).map((d) => getLocalDateKey(d)),
+  );
+  const shieldedLast7Set = new Set<string>(
+    summary.last7Days.filter((d) => d.status === 'shielded_rest').map((d) => d.date),
+  );
+
+  const bestStreakDays = Math.max(
+    summary.streakDays,
+    computeBestHistoricalStreakDays(fullTrainedSet, todayIso),
+  );
+
+  // Close the 28-day window on the Sunday of the current local week (L M X J V S D)
+  const [ty, tm, td] = todayIso.split('-').map((n) => parseInt(n, 10));
+  const todayDt = new Date(ty, (tm || 1) - 1, td || 1);
+  const daysUntilSunday = Number.isNaN(todayDt.getTime())
+    ? 0
+    : (7 - todayDt.getDay()) % 7;
+  const endSundayIso = shiftIsoDate(todayIso, daysUntilSunday);
+  const startIso = shiftIsoDate(endSundayIso, -27);
+
+  const cells: StreakHeatmapDayCell[] = [];
+  let trainedDays28d = 0;
+  let restOrPauseDays28d = 0;
+  let elapsedDays28d = 0;
+
+  for (let offset = 0; offset < 28; offset += 1) {
+    const date = shiftIsoDate(startIso, offset);
+    const dayNumber = parseInt(date.slice(8, 10), 10) || 1;
+    const isToday = date === todayIso;
+    const isFuture = date > todayIso;
+
+    let status: StreakHeatmapDayStatus = 'inactive';
+    let label = 'Sin actividad';
+
+    if (isFuture) {
+      status = 'future';
+      label = 'Próximo';
+    } else {
+      elapsedDays28d += 1;
+      if (hardTrainedSet.has(date)) {
+        status = 'trained';
+        label = 'Entrenamiento cumplido';
+        trainedDays28d += 1;
+      } else if (
+        scheduledRestSet.has(date) ||
+        activePauseSet.has(date) ||
+        shieldedLast7Set.has(date)
+      ) {
+        status = 'rest_or_pause';
+        label = activePauseSet.has(date)
+          ? 'Pausa activa'
+          : 'Descanso programado / Escudo';
+        restOrPauseDays28d += 1;
+      }
+    }
+
+    cells.push({
+      date,
+      dayNumber,
+      isToday,
+      isFuture,
+      status,
+      label,
+    });
+  }
+
+  const consistencyPct =
+    elapsedDays28d > 0
+      ? Math.min(
+          100,
+          Math.round(((trainedDays28d + restOrPauseDays28d) / elapsedDays28d) * 100),
+        )
+      : 0;
+
+  return {
+    currentStreakDays: summary.streakDays,
+    bestStreakDays,
+    consistencyPct,
+    trainedDays28d,
+    restOrPauseDays28d,
+    elapsedDays28d,
+    startIso,
+    endSundayIso,
+    cells,
+  };
+}
+

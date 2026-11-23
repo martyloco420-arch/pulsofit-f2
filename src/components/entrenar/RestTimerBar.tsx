@@ -1,5 +1,12 @@
-import React from 'react';
-import { RotateCcw, SkipForward, Timer } from 'lucide-react';
+import React, { useEffect, useState } from 'react';
+import { Pause, Play, RotateCcw, SkipForward, Timer } from 'lucide-react';
+
+export function computeRemainingSeconds(
+  targetEndTime: number,
+  nowMs: number = Date.now(),
+): number {
+  return Math.max(0, Math.ceil((targetEndTime - nowMs) / 1000));
+}
 
 export function formatSeconds(totalSec: number): string {
   const s = Math.max(0, Math.floor(totalSec));
@@ -51,23 +58,63 @@ export function triggerRestCompletionVibration(): void {
 export interface RestTimerBarProps {
   restRemaining: number;
   restTotal: number;
+  targetEndTime?: number | null;
+  isPaused?: boolean;
   nextExerciseLabel?: string | null;
   onAdjust: (deltaSec: number) => void;
   onRestart: () => void;
   onSkip: () => void;
+  onTogglePause?: () => void;
 }
 
 export const RestTimerBar: React.FC<RestTimerBarProps> = ({
   restRemaining,
   restTotal,
+  targetEndTime = null,
+  isPaused = false,
   nextExerciseLabel,
   onAdjust,
   onRestart,
   onSkip,
+  onTogglePause,
 }) => {
+  const [syncedRemaining, setSyncedRemaining] = useState<number>(() =>
+    targetEndTime !== null && !isPaused
+      ? computeRemainingSeconds(targetEndTime)
+      : restRemaining,
+  );
+
+  useEffect(() => {
+    if (isPaused || targetEndTime === null) {
+      setSyncedRemaining(restRemaining);
+      return undefined;
+    }
+
+    const syncFromTimestamp = () => {
+      setSyncedRemaining(computeRemainingSeconds(targetEndTime));
+    };
+
+    const handleVisibilityChange = () => {
+      if (document.visibilityState === 'visible') {
+        syncFromTimestamp();
+      }
+    };
+
+    syncFromTimestamp();
+    const id = window.setInterval(syncFromTimestamp, 250);
+    document.addEventListener('visibilitychange', handleVisibilityChange);
+    return () => {
+      window.clearInterval(id);
+      document.removeEventListener('visibilitychange', handleVisibilityChange);
+    };
+  }, [targetEndTime, isPaused, restRemaining]);
+
+  const displayRemaining =
+    !isPaused && targetEndTime !== null ? syncedRemaining : restRemaining;
+
   const progressPct = Math.min(
     100,
-    Math.round((restRemaining / Math.max(1, restTotal)) * 100),
+    Math.round((displayRemaining / Math.max(1, restTotal)) * 100),
   );
 
   return (
@@ -81,7 +128,7 @@ export const RestTimerBar: React.FC<RestTimerBarProps> = ({
           <Timer className="w-4 h-4 text-[#D4FF33] shrink-0" />
           <div className="min-w-0">
             <p className="text-[11px] font-bold text-[#D4FF33] uppercase">
-              Descanso activo
+              {isPaused ? 'Descanso en pausa' : 'Descanso activo'}
             </p>
             <p className="text-xs text-zinc-300 truncate">
               {nextExerciseLabel
@@ -90,9 +137,25 @@ export const RestTimerBar: React.FC<RestTimerBarProps> = ({
             </p>
           </div>
         </div>
-        <span className="text-2xl font-extrabold font-mono tabular-nums text-white shrink-0">
-          {formatSeconds(restRemaining)}
-        </span>
+        <div className="flex items-center gap-2 shrink-0">
+          {onTogglePause && (
+            <button
+              type="button"
+              onClick={onTogglePause}
+              aria-label={isPaused ? 'Reanudar descanso' : 'Pausar descanso'}
+              className="min-h-[38px] min-w-[38px] rounded-xl border border-[#2A2F3D] bg-[#1C2029] text-white flex items-center justify-center active:scale-95"
+            >
+              {isPaused ? (
+                <Play className="w-4 h-4 fill-current text-[#D4FF33]" />
+              ) : (
+                <Pause className="w-4 h-4 text-zinc-200" />
+              )}
+            </button>
+          )}
+          <span className="text-2xl font-extrabold font-mono tabular-nums text-white shrink-0">
+            {formatSeconds(displayRemaining)}
+          </span>
+        </div>
       </div>
 
       <div className="h-1.5 w-full rounded-full bg-[#1F2430] overflow-hidden">

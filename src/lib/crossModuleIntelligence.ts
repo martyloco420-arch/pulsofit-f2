@@ -1,5 +1,17 @@
 import { calculateNutritionTargets } from '../data/foods';
-import { getLocalDateKey, getTodayIsoDate } from './storage';
+import type { PersonalCoachContext } from './aiClient';
+import { shiftIsoDate } from './compareDates';
+import { computeDailyActivitySummary } from './dailyActivity';
+import { computeHydrationGoal } from './hydration';
+import { getLocalDateKey, getSavedCustomGoal, getTodayIsoDate } from './storage';
+import { computeFlexibleStreakSummary } from './streakEngine';
+import {
+  formatLiquid,
+  formatWeight,
+  getLiquidUnit,
+  getWeightUnit,
+  kgToDisplayWeight,
+} from './units';
 import type {
   AppDatabase,
   CardioSession,
@@ -247,7 +259,7 @@ export function computeRecoveryIndex0To100(db: AppDatabase): RecoveryIndexSummar
           ? 'Estrés moderado'
           : 'Estrés elevado';
 
-  let statusLabel = 'Recuperación óptima';
+  let statusLabel = 'Óptimo';
   let accentHex = '#a3e635';
   let recommendation = 'Sistema listo para cargas altas, PRs o intervalos intensos.';
 
@@ -256,17 +268,17 @@ export function computeRecoveryIndex0To100(db: AppDatabase): RecoveryIndexSummar
     accentHex = '#38bdf8';
     recommendation =
       'Registra una noche en Sueño o mide tu pulso PPG para calibrar tu índice real.';
-  } else if (score >= 78) {
-    statusLabel = 'Óptima para exigirte';
+  } else if (score >= 70) {
+    statusLabel = 'Óptimo';
     accentHex = '#a3e635';
     recommendation = 'Alta disponibilidad neuromuscular y autonómica. Ideal para sesión intensa.';
-  } else if (score >= 55) {
-    statusLabel = 'Moderada';
+  } else if (score >= 45) {
+    statusLabel = 'Moderado';
     accentHex = '#fbbf24';
     recommendation = 'Entrena con normalidad controlando volumen y respetando descansos.';
   } else {
-    statusLabel = 'Recuperación baja';
-    accentHex = '#fb7185';
+    statusLabel = 'Recuperación';
+    accentHex = '#38bdf8';
     recommendation = 'Prioriza técnica suave, caminata ligera, hidratación y sueño temprano.';
   }
 
@@ -406,5 +418,480 @@ export function computeSleepPulseIntensityAlert(
     title,
     message,
     suggestion,
+  };
+}
+
+const GOAL_LABEL_MAP: Record<string, string> = {
+  perder_grasa: 'Pérdida de grasa',
+  mantener_peso: 'Recomposición y mantenimiento',
+  ganar_musculo: 'Fuerza e hipertrofia',
+};
+
+function avgNums(values: number[]): number | null {
+  if (values.length === 0) return null;
+  return Math.round((values.reduce((sum, v) => sum + v, 0) / values.length) * 10) / 10;
+}
+
+/**
+ * Construye el snapshot omnisciente del perfil activo (fechas locales en-CA)
+ * cruzando Perfil, Equipo, Descansos/Modo Turno, Biometría 7d/30d, Entrenos/PRs/RPE,
+ * Nutrición, Hidratación, Sueño y Racha para alimentar al AI Coach y al Briefing del Día.
+ */
+export function buildOmniscientCoachContext(
+  db: AppDatabase,
+  activeProfileId?: string,
+): PersonalCoachContext {
+  const profile = db.profile;
+  const todayIso = getTodayIsoDate();
+  const sevenDaysAgoIso = shiftIsoDate(todayIso, -6);
+  const thirtyDaysAgoIso = shiftIsoDate(todayIso, -29);
+  const weightUnit = getWeightUnit(profile.weightUnit);
+  const liquidUnit = getLiquidUnit(profile.liquidUnit);
+
+  const recoveryIndex = computeRecoveryIndex0To100(db);
+  const streakSummary = computeFlexibleStreakSummary(db, todayIso);
+  const todayAct = computeDailyActivitySummary(db, todayIso);
+  const todayBurn = computeDailyExerciseBurn(
+    profile,
+    db.workouts,
+    db.cardioSessions ?? [],
+    db.hiitSessions ?? [],
+    todayIso,
+  );
+
+  const fallbackTargets = calculateNutritionTargets(profile);
+  const baseCalTarget = db.adaptiveNutrition?.calorieTarget ?? fallbackTargets.calories;
+  const proteinTargetG = db.adaptiveNutrition?.proteinG ?? fallbackTargets.proteinG;
+  const caloriesTarget = baseCalTarget + todayBurn.totalExerciseKcal;
+
+  const todayFoods = db.foodLogs.filter((f) => f.date === todayIso);
+  const caloriesConsumed = Math.round(
+    todayFoods.reduce((s, f) => s + (f.calories || 0), 0),
+  );
+  const proteinConsumedG = Math.round(
+    todayFoods.reduce((s, f) => s + (f.proteinG || 0), 0),
+  );
+
+  const todayWaterMl = Math.max(0, db.hydrationByDate?.[todayIso] ?? 0);
+  const todayElectrolytes = Math.max(0, db.electrolytesByDate?.[todayIso] ?? 0);
+  const todayPausaCount = Math.max(
+    0,
+    db.manualActivityByDate?.[todayIso]?.pausaActivaCount ?? 0,
+  );
+  const waterGoalToday = computeHydrationGoal(
+    profile,
+    db.bodyWeights,
+    db.bodyScans,
+    db.workouts,
+    db.hydrationSettings ?? {
+      mlPerKg: 35,
+      containerMl: 500,
+      wakeHour: 7,
+      sleepHour: 22,
+      hotDayByDate: {},
+      remindersEnabled: false,
+    },
+    todayIso,
+    db.cardioSessions ?? [],
+    db.hiitSessions ?? [],
+  ).totalTargetMl;
+  const waterPct =
+    waterGoalToday > 0
+      ? Math.min(100, Math.round((todayWaterMl / waterGoalToday) * 100))
+      : 0;
+
+  // 1. Pesos 7d / 30d & Antropometría
+  const weightMap = new Map<string, number>();
+  for (const bw of db.bodyWeights) {
+    if (bw.date && Number.isFinite(bw.weightKg) && bw.weightKg > 0) {
+      weightMap.set(bw.date, bw.weightKg);
+    }
+  }
+  for (const sc of db.bodyScans) {
+    if (sc.date && Number.isFinite(sc.weightKg) && sc.weightKg > 0) {
+      weightMap.set(sc.date, sc.weightKg);
+    }
+  }
+  const weightPoints = Array.from(weightMap.entries())
+    .map(([date, kg]) => ({ date, kg }))
+    .sort((a, b) => a.date.localeCompare(b.date));
+  const latestW = weightPoints[weightPoints.length - 1] ?? null;
+
+  const findBaseline = (cutoffIso: string) => {
+    const candidates = weightPoints.filter((w) => w.date >= cutoffIso);
+    if (candidates.length >= 2) return candidates[0];
+    return weightPoints.length >= 2 ? weightPoints[0] : null;
+  };
+  const formatDelta = (baseKg: number | null | undefined) => {
+    if (!latestW || !baseKg) return null;
+    const diffDisplay =
+      Math.round(
+        (kgToDisplayWeight(latestW.kg, weightUnit) -
+          kgToDisplayWeight(baseKg, weightUnit)) *
+          10,
+      ) / 10;
+    const sign = diffDisplay > 0 ? '+' : '';
+    return `${sign}${diffDisplay} ${weightUnit}`;
+  };
+
+  const base7 = findBaseline(sevenDaysAgoIso);
+  const base30 = findBaseline(thirtyDaysAgoIso);
+
+  const latestScan = [...db.bodyScans].sort((a, b) =>
+    (b.recordedAt || b.date).localeCompare(a.recordedAt || a.date),
+  )[0];
+  const latestMeasurement = [...(db.bodyMeasurements ?? [])]
+    .filter((m) => typeof m.waistCm === 'number' && m.waistCm > 0)
+    .sort((a, b) => b.date.localeCompare(a.date))[0];
+  const waistCm =
+    latestMeasurement?.waistCm ??
+    (latestScan?.waistCm && latestScan.waistCm > 0 ? latestScan.waistCm : null);
+
+  // 2. Presión Arterial, FC reposo y HRV (7d y 30d)
+  const bpRecords = [...(db.bloodPressureRecords ?? [])].sort((a, b) =>
+    (b.recordedAt || b.date).localeCompare(a.recordedAt || a.date),
+  );
+  const latestBp = bpRecords[0] ?? null;
+  const bp7 = bpRecords.filter((b) => getLocalDateKey(b.date || b.recordedAt) >= sevenDaysAgoIso);
+  const bp30 = bpRecords.filter((b) => getLocalDateKey(b.date || b.recordedAt) >= thirtyDaysAgoIso);
+
+  const formatBpAvg = (list: typeof bpRecords) => {
+    if (list.length === 0) return null;
+    const avgSys = Math.round(list.reduce((s, r) => s + r.systolic, 0) / list.length);
+    const avgDia = Math.round(list.reduce((s, r) => s + r.diastolic, 0) / list.length);
+    return `${avgSys}/${avgDia} mmHg`;
+  };
+
+  const pulseRecords = [...(db.pulseHrvRecords ?? [])];
+  const hrValues7: number[] = [];
+  const hrValues30: number[] = [];
+  const hrvValues7: number[] = [];
+  const hrvValues30: number[] = [];
+
+  for (const p of pulseRecords) {
+    const d = getLocalDateKey(p.date || p.recordedAt);
+    if (d >= thirtyDaysAgoIso) {
+      if (p.bpm > 0) hrValues30.push(p.bpm);
+      if (p.hrvRmssdMs > 0) hrvValues30.push(p.hrvRmssdMs);
+      if (d >= sevenDaysAgoIso) {
+        if (p.bpm > 0) hrValues7.push(p.bpm);
+        if (p.hrvRmssdMs > 0) hrvValues7.push(p.hrvRmssdMs);
+      }
+    }
+  }
+  for (const bp of bpRecords) {
+    const d = getLocalDateKey(bp.date || bp.recordedAt);
+    if (d >= thirtyDaysAgoIso && typeof bp.pulseBpm === 'number' && bp.pulseBpm > 0) {
+      hrValues30.push(bp.pulseBpm);
+      if (d >= sevenDaysAgoIso) {
+        hrValues7.push(bp.pulseBpm);
+      }
+    }
+  }
+
+  // 3. Entrenamientos recientes (Fuerza, HIIT, Cardio), RPE promedio y PRs
+  const workouts7 = db.workouts.filter((w) => {
+    const d = getLocalDateKey(w.completedAt);
+    return d >= sevenDaysAgoIso && d <= todayIso;
+  });
+  const cardio7 = (db.cardioSessions ?? []).filter((c) => {
+    const d = getLocalDateKey(c.date || c.completedAt);
+    return d >= sevenDaysAgoIso && d <= todayIso;
+  });
+  const hiit7 = (db.hiitSessions ?? []).filter((h) => {
+    const d = getLocalDateKey(h.date || h.completedAt);
+    return d >= sevenDaysAgoIso && d <= todayIso;
+  });
+  const workoutsLast7Days = workouts7.length + cardio7.length + hiit7.length;
+
+  const sortedWorkouts = [...db.workouts].sort((a, b) =>
+    b.completedAt.localeCompare(a.completedAt),
+  );
+  const latestWorkout = sortedWorkouts[0];
+  let lastWorkoutSummary: string | null = null;
+  if (latestWorkout) {
+    const rpes = latestWorkout.exercises
+      .flatMap((ex) => ex.sets)
+      .map((s) => s.rpe)
+      .filter((r): r is number => typeof r === 'number' && r > 0);
+    const avgRpe =
+      rpes.length > 0
+        ? (rpes.reduce((a, b) => a + b, 0) / rpes.length).toFixed(1)
+        : null;
+    lastWorkoutSummary = avgRpe
+      ? `${latestWorkout.title} · RPE ${avgRpe}`
+      : latestWorkout.title;
+  }
+
+  const rpe7Values = workouts7
+    .flatMap((w) => w.exercises)
+    .flatMap((ex) => ex.sets)
+    .map((s) => s.rpe)
+    .filter((r): r is number => typeof r === 'number' && r > 0);
+  const avgWorkoutRpe7d = avgNums(rpe7Values);
+
+  const recentPrLabels: string[] = [];
+  for (const w of sortedWorkouts) {
+    const d = getLocalDateKey(w.completedAt);
+    if (d < thirtyDaysAgoIso) continue;
+    if (Array.isArray(w.prLabels) && w.prLabels.length > 0) {
+      for (const lbl of w.prLabels) {
+        if (lbl && !recentPrLabels.includes(lbl)) {
+          recentPrLabels.push(lbl);
+        }
+      }
+    } else {
+      for (const ex of w.exercises) {
+        for (const s of ex.sets) {
+          if (s.isPR && Array.isArray(s.prLabels)) {
+            for (const lbl of s.prLabels) {
+              const label = `${ex.name}: ${lbl}`;
+              if (!recentPrLabels.includes(label)) {
+                recentPrLabels.push(label);
+              }
+            }
+          }
+        }
+      }
+    }
+    if (recentPrLabels.length >= 4) break;
+  }
+  for (const c of [...(db.cardioSessions ?? [])].sort((a, b) =>
+    b.completedAt.localeCompare(a.completedAt),
+  )) {
+    if (recentPrLabels.length >= 5) break;
+    const d = getLocalDateKey(c.date || c.completedAt);
+    if (d < thirtyDaysAgoIso) continue;
+    if (c.isPR && Array.isArray(c.prLabels)) {
+      for (const lbl of c.prLabels) {
+        if (lbl && !recentPrLabels.includes(lbl)) {
+          recentPrLabels.push(lbl);
+        }
+      }
+    }
+  }
+
+  const recentWorkoutsSummary: string[] = [];
+  for (const w of sortedWorkouts.slice(0, 3)) {
+    const d = getLocalDateKey(w.completedAt);
+    const prBadge = w.isPR ? ' ★PR' : '';
+    recentWorkoutsSummary.push(`${d}: ${w.title} (${Math.round(w.durationSec / 60)}m)${prBadge}`);
+  }
+  for (const c of [...(db.cardioSessions ?? [])]
+    .sort((a, b) => b.completedAt.localeCompare(a.completedAt))
+    .slice(0, 2)) {
+    recentWorkoutsSummary.push(
+      `${c.date}: ${c.activityType} ${c.distanceKm.toFixed(1)} km${c.isPR ? ' ★PR' : ''}`,
+    );
+  }
+
+  // 4. Objetivo persistente customGoal
+  const savedLocalGoal = activeProfileId ? getSavedCustomGoal(activeProfileId) : '';
+  const resolvedCustomGoal =
+    profile.customGoal?.trim() || savedLocalGoal || null;
+
+  const syncedModules: string[] = [
+    'Perfil y Equipo',
+    'Biometría 7d/30d',
+    'Entrenos y PRs',
+    'Nutrición y Agua',
+    'Sueño y Racha',
+  ];
+
+  return {
+    profileName: profile.name || 'Atleta',
+    goal: profile.goal,
+    customGoal: resolvedCustomGoal,
+    age: profile.age,
+    heightCm: profile.heightCm,
+    targetWeightDisplay: profile.targetWeightKg
+      ? formatWeight(profile.targetWeightKg, weightUnit)
+      : null,
+    equipment: profile.equipment,
+    trainingDaysPerWeek: profile.trainingDaysPerWeek,
+    scheduledRestDates: (db.scheduledRestDates ?? []).slice(-7),
+    pausaActivaCountToday: todayPausaCount,
+    shiftModeActive: streakSummary.isTodayScheduledRest || todayPausaCount > 0,
+    weightUnit,
+    liquidUnit,
+    personality: db.coachPersonality ?? 'sargento',
+    daysSinceLastWorkout: streakSummary.daysSinceLastWorkout,
+    workoutsLast7Days,
+    trainedToday: streakSummary.isTodayTrained,
+    lastWorkoutSummary,
+    avgWorkoutRpe7d,
+    recentWorkoutsSummary: recentWorkoutsSummary.slice(0, 4),
+    recentPrLabels: recentPrLabels.slice(0, 4),
+    recentCardioCount7d: cardio7.length,
+    recentHiitCount7d: hiit7.length,
+    latestWeightDisplay: latestW ? formatWeight(latestW.kg, weightUnit) : null,
+    weightDelta7dDisplay:
+      base7 && base7.date !== latestW?.date ? formatDelta(base7.kg) : null,
+    weightDelta30dDisplay:
+      base30 && base30.date !== latestW?.date ? formatDelta(base30.kg) : null,
+    waistCm,
+    bodyFatPct: latestScan ? latestScan.bodyFatPct : null,
+    muscleMassPct: latestScan ? latestScan.totalMusclePct : null,
+    todaySteps: todayAct.steps,
+    stepsGoal: todayAct.stepsGoal,
+    activeMinutesToday: todayAct.activeMin,
+    activeMinutesGoal: todayAct.activeMinGoal,
+    activeKcalToday: todayAct.activeKcal,
+    activeKcalGoal: todayAct.activeKcalGoal,
+    waterConsumedDisplay: formatLiquid(todayWaterMl, liquidUnit),
+    waterTargetDisplay: formatLiquid(waterGoalToday, liquidUnit),
+    waterPct,
+    electrolytesToday: todayElectrolytes,
+    pausaActivaDoneToday: todayPausaCount > 0,
+    caloriesConsumed,
+    caloriesTarget,
+    proteinConsumedG,
+    proteinTargetG,
+    sleepQualityPct: recoveryIndex.sleepQualityPct,
+    sleepHours:
+      recoveryIndex.sleepDurationMin !== null
+        ? Math.round((recoveryIndex.sleepDurationMin / 60) * 10) / 10
+        : null,
+    pulseBpm: recoveryIndex.bpm,
+    hrvMs: recoveryIndex.hrvMs,
+    avgBpm7d: avgNums(hrValues7),
+    avgBpm30d: avgNums(hrValues30),
+    avgHrv7d: avgNums(hrvValues7),
+    avgHrv30d: avgNums(hrvValues30),
+    stressLabel: recoveryIndex.stressLabel,
+    lastBpDisplay: latestBp
+      ? `${latestBp.systolic}/${latestBp.diastolic} mmHg (${latestBp.category})`
+      : null,
+    avgBp7dDisplay: formatBpAvg(bp7),
+    avgBp30dDisplay: formatBpAvg(bp30),
+    recoveryIndexScore: recoveryIndex.score,
+    recoveryStatusLabel: recoveryIndex.statusLabel,
+    streakDays: streakSummary.streakDays,
+    shieldUsedInCurrent7d: streakSummary.shieldUsedInCurrent7d,
+    isTodayRestShield: streakSummary.isTodayScheduledRest,
+    syncedModules,
+  };
+}
+
+export type ReadinessRingTier = 'optimal' | 'moderate' | 'recovery';
+
+export interface DeterministicDailyBriefing {
+  tier: ReadinessRingTier;
+  tierLabel: string;
+  accentHex: string;
+  glowRgba: string;
+  score: number;
+  hasRealSignals: boolean;
+  headline: string;
+  readinessSummary: string;
+  trainingPrescription: string;
+  proteinRemainingG: number;
+  caloriesRemaining: number;
+  waterPct: number;
+  waterStatusText: string;
+  objectiveLabel: string;
+  latestPrLabel: string | null;
+}
+
+export function buildDeterministicDailyBriefing(
+  db: AppDatabase,
+  context: PersonalCoachContext,
+): DeterministicDailyBriefing {
+  const recovery = computeRecoveryIndex0To100(db);
+  const score = recovery.score;
+
+  let tier: ReadinessRingTier = 'optimal';
+  let tierLabel = 'Óptimo';
+  let accentHex = '#a3e635';
+  let glowRgba = 'rgba(163, 230, 53, 0.34)';
+
+  if (score < 45) {
+    tier = 'recovery';
+    tierLabel = 'Recuperación';
+    accentHex = '#38bdf8';
+    glowRgba = 'rgba(56, 189, 248, 0.34)';
+  } else if (score < 70) {
+    tier = 'moderate';
+    tierLabel = 'Moderado';
+    accentHex = '#fbbf24';
+    glowRgba = 'rgba(251, 191, 36, 0.32)';
+  }
+
+  const proteinRemainingG = Math.max(
+    0,
+    Math.round(context.proteinTargetG - context.proteinConsumedG),
+  );
+  const caloriesRemaining = Math.max(
+    0,
+    Math.round(context.caloriesTarget - context.caloriesConsumed),
+  );
+
+  const objectiveLabel =
+    context.customGoal?.trim() ||
+    GOAL_LABEL_MAP[context.goal] ||
+    'Salud y rendimiento';
+
+  let headline = 'Listo para empujar fuerte hoy';
+  let trainingPrescription =
+    'Disponibilidad alta: busca sobrecarga progresiva o intervalos exigentes.';
+
+  if (context.isTodayRestShield) {
+    headline = 'Día protegido con Escudo de Descanso';
+    trainingPrescription =
+      'Mantén pasos suaves, electrolitos y estiramientos sin presión de carga.';
+  } else if (context.trainedToday) {
+    headline = 'Entrenamiento del día completado';
+    trainingPrescription =
+      proteinRemainingG > 25
+        ? `Prioriza recuperación: cubre los ${proteinRemainingG}g de proteína restantes e hidrátate.`
+        : 'Excelente ejecución hoy. Prioriza hidratación y sueño reparador.';
+  } else if (!recovery.hasRealSignals) {
+    headline = 'Calibra tus sensores de recuperación';
+    trainingPrescription =
+      'Mide tu pulso PPG o registra sueño para ajustar la intensidad de tu sesión.';
+  } else if (tier === 'recovery') {
+    headline = 'Prioridad: descarga y recuperación';
+    trainingPrescription =
+      'Baja el volumen/carga 15–20%, prioriza movilidad, caminata o Pausa Activa.';
+  } else if (tier === 'moderate') {
+    headline = 'Estado moderado: entreno controlado';
+    trainingPrescription =
+      'Trabaja en RPE 7–8 respetando descansos entre series sin llegar al fallo.';
+  }
+
+  const hrvFragment =
+    context.hrvMs !== null
+      ? `HRV en ${context.hrvMs} ms${
+          context.avgHrv7d ? ` (prom 7d: ${context.avgHrv7d} ms)` : ''
+        }`
+      : 'Sin toma HRV reciente';
+  const bpmFragment =
+    context.pulseBpm !== null ? `FC reposo ${context.pulseBpm} BPM` : 'Sin pulso reposo';
+  const sleepFragment =
+    context.sleepHours !== null
+      ? `Sueño ${context.sleepHours.toFixed(1)}h${
+          context.sleepQualityPct !== null ? ` (${context.sleepQualityPct}%)` : ''
+        }`
+      : 'Sueño por registrar';
+
+  const readinessSummary = `${hrvFragment} · ${bpmFragment} · ${sleepFragment}.`;
+  const waterStatusText = `${context.waterConsumedDisplay} / ${context.waterTargetDisplay} (${context.waterPct}%)`;
+
+  return {
+    tier,
+    tierLabel,
+    accentHex,
+    glowRgba,
+    score,
+    hasRealSignals: recovery.hasRealSignals,
+    headline,
+    readinessSummary,
+    trainingPrescription,
+    proteinRemainingG,
+    caloriesRemaining,
+    waterPct: context.waterPct,
+    waterStatusText,
+    objectiveLabel,
+    latestPrLabel: context.recentPrLabels?.[0] ?? null,
   };
 }

@@ -26,6 +26,8 @@ export {
   createDefaultProfile,
   deleteProfileStorage,
   getActiveProfileId,
+  getSavedCustomGoal,
+  isProfileUncalibrated,
   loadProfileRegistry,
   normalizeCoachChatHistory,
   normalizeManualActivityMap,
@@ -33,6 +35,7 @@ export {
   normalizeScheduledRestDates,
   normalizeUserProfile,
   recalculateLatestWeightAndAdaptiveNutrition,
+  saveCustomGoalToLocal,
   saveProfileRegistry,
   setActiveProfileId,
 } from './storage/profileRepo';
@@ -53,6 +56,12 @@ export {
 } from './storage/workoutRepo';
 
 export {
+  type HrvRhr30dSummary,
+  type HrvRhrDailyPoint,
+  type HrvRhrRangeDays,
+  type HrvRhrTrendSummary,
+  computeHrvRhr30dTrend,
+  computeHrvRhrTrend,
   countBiometricsDomainByDate,
   deleteBloodPressureRecord,
   deleteMeasurementRecord,
@@ -60,6 +69,8 @@ export {
   deletePulseRecord,
   deleteSleepRecord,
   filterBiometricsDomainByDate,
+  loadActiveProfileHrvRhr30d,
+  loadActiveProfileHrvRhrTrend,
   normalizeBiometricsDomain,
   normalizeBloodPressureRecord,
   normalizeBodyScan,
